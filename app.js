@@ -81,11 +81,70 @@ const DB = {
   byIndex: (s, i, v) => run(s, 'readonly', st => st.index(i).getAll(v)),
 };
 const DEFAULT_PEOPLE = ['Main Contractor', 'Electrician', 'Plumber', 'Joiner', 'Decorator', 'Client'];
+const DEFAULT_SURVEYORS = ['Paul Bonner', 'Paul Heaton', 'Kass Weetman', 'Alex Slattery', 'Mike Slattery', 'Stuart Clements'];
+const DEFAULT_DISCIPLINES = ['HVAC', 'Plumbing', 'Pipework', 'CAD', 'Engineering'];
+const DEFAULT_COMPANY = 'adi Climate Systems Limited';
 const Settings = {
   async get(k, def) { const v = await DB.get('kv', k); return v === undefined ? def : v; },
   set: (k, v) => DB.put('kv', v, k),
   people() { return this.get('people', DEFAULT_PEOPLE); },
+  surveyors() { return this.get('surveyors', DEFAULT_SURVEYORS); },
+  disciplines() { return this.get('disciplines', DEFAULT_DISCIPLINES); },
+  company() { return this.get('company', DEFAULT_COMPANY); },
 };
+// One-off upgrade for devices that used the first version (company was blank then).
+async function seedDefaults() {
+  if ((await Settings.get('seed', 0)) >= 2) return;
+  if (!(await Settings.get('company', ''))) await Settings.set('company', DEFAULT_COMPANY);
+  await Settings.set('seed', 2);
+}
+
+// <select> with an "Add another…" option that prompts for a new name and remembers it.
+const ADD = '__add__';
+function listSelect(list, value, placeholder) {
+  const opts = value && !list.includes(value) ? [...list, value] : list;
+  return `<option value="">${esc(placeholder)}</option>`
+    + opts.map(o => `<option ${o === value ? 'selected' : ''}>${esc(o)}</option>`).join('')
+    + `<option value="${ADD}">+ Add another…</option>`;
+}
+function bindListSelect(sel, settingsKey, getList, placeholder, onPick, promptText) {
+  sel.addEventListener('change', async () => {
+    let v = sel.value;
+    if (v === ADD) {
+      v = (prompt(promptText) || '').trim();
+      const list = await getList();
+      if (v && !list.includes(v)) await Settings.set(settingsKey, [...list, v]);
+      sel.innerHTML = listSelect(await getList(), v || sel.dataset.last || '', placeholder);
+      if (!v) return;
+    }
+    sel.dataset.last = v;
+    onPick(v);
+  });
+}
+
+// Row of one-tap chips (single choice) with "+ Add" that remembers new entries.
+function bindChipPicker(el, { get, set, list, settingsKey, promptText, onChange }) {
+  let items = list;
+  const render = () => {
+    const cur = get();
+    const shown = !cur || items.includes(cur) ? items : [...items, cur];
+    el.innerHTML = shown.map(p => `<button class="chip ${p === cur ? 'on' : ''}" data-p="${esc(p)}">${esc(p)}</button>`).join('')
+      + `<button class="chip add" data-add="1">+ Add</button>`;
+  };
+  render();
+  el.onclick = async e => {
+    const b = e.target.closest('button'); if (!b) return;
+    if (b.dataset.add) {
+      const name = (prompt(promptText) || '').trim();
+      if (!name) return;
+      if (!items.includes(name)) { items = [...items, name]; await Settings.set(settingsKey, items); }
+      set(name);
+    } else {
+      set(get() === b.dataset.p ? '' : b.dataset.p);
+    }
+    render(); onChange();
+  };
+}
 
 async function getItems(surveyId) {
   const items = await DB.byIndex('items', 'surveyId', surveyId);
@@ -193,10 +252,41 @@ const go = h => { if (location.hash === h) route(); else location.hash = h; };
 
 // ---------------------------------------------------------------- home
 let installPrompt = null;
-window.addEventListener('beforeinstallprompt', e => { e.preventDefault(); installPrompt = e; $('#installBtn')?.removeAttribute('hidden'); });
+window.addEventListener('beforeinstallprompt', e => { e.preventDefault(); installPrompt = e; });
+window.addEventListener('appinstalled', () => { installPrompt = null; $('#installBtn')?.setAttribute('hidden', ''); toast('App installed'); });
+const isInstalled = () => matchMedia('(display-mode: standalone)').matches || navigator.standalone === true;
+
+async function installApp() {
+  if (installPrompt) {
+    try {
+      const p = installPrompt; installPrompt = null;   // Chrome allows each prompt to be used once
+      await p.prompt();
+      if ((await p.userChoice).outcome === 'accepted') return;
+    } catch (e) { console.warn(e); }
+  }
+  showInstallHelp();
+}
+function showInstallHelp() {
+  const ua = navigator.userAgent;
+  const ios = /iPad|iPhone|iPod/.test(ua) || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
+  const steps = ios
+    ? (/CriOS|FxiOS|EdgiOS/.test(ua)
+      ? ['Tap the <strong>Share</strong> button (square with an up arrow) in the address bar.', 'Choose <strong>Add to Home Screen</strong>. If it is not listed, open this page in <strong>Safari</strong> and try again.']
+      : ['Tap the <strong>Share</strong> button (square with an up arrow) at the bottom of Safari.', 'Scroll down and tap <strong>Add to Home Screen</strong>, then <strong>Add</strong>.'])
+    : ['Tap the browser menu <strong>⋮</strong> (top-right in Chrome).', 'Tap <strong>Install app</strong> or <strong>Add to Home screen</strong>, then confirm.'];
+  const back = document.createElement('div');
+  back.className = 'sheet-back';
+  back.innerHTML = `<div class="sheet" role="dialog" aria-label="Install">
+    <h3>Install on this device</h3>
+    <ol class="install-steps">${steps.map(s => `<li>${s}</li>`).join('')}</ol>
+    <p class="small muted">The app then opens full-screen from its home-screen icon and works without signal.${location.protocol !== 'https:' && location.hostname !== 'localhost' ? ' <strong>Note:</strong> installing only works when the app is opened from its secure <strong>https://</strong> address.' : ''}</p>
+    <button class="btn primary block" id="ih-ok">OK</button></div>`;
+  document.body.appendChild(back);
+  back.onclick = e => { if (e.target === back || e.target.id === 'ih-ok') back.remove(); };
+}
 
 async function viewHome() {
-  setHeader('Site Snag', null, `<a class="icon-btn" href="#/settings" aria-label="Settings">${icon('gear')}</a>`);
+  setHeader('adi Site Snag', null, `<a class="icon-btn" href="#/settings" aria-label="Settings">${icon('gear')}</a>`);
   const surveys = (await DB.all('surveys')).sort((a, b) => b.updatedAt - a.updatedAt);
   const items = await DB.all('items');
   const stats = {};
@@ -205,7 +295,8 @@ async function viewHome() {
     s.n++; if (it.status !== 'Complete') s.open++;
   }
   view().innerHTML = `
-    <button id="installBtn" class="btn block" ${installPrompt ? '' : 'hidden'} style="margin-bottom:12px">${icon('download')} Install app on this device</button>
+    <div class="brand"><img src="img/adi-logo.jpg" alt="adi Climate Systems"><div class="brand-app">Site Survey<br>&amp; Snagging</div></div>
+    <button id="installBtn" class="btn block" ${isInstalled() ? 'hidden' : ''} style="margin-bottom:12px">${icon('download')} Install app on this device</button>
     ${surveys.length ? `<div class="list">${surveys.map(s => {
       const st = stats[s.id] || { n: 0, open: 0 };
       return `<a class="survey-card" href="#/s/${s.id}">
@@ -217,7 +308,7 @@ async function viewHome() {
         </div></a>`;
     }).join('')}</div>` : `<div class="empty">${icon('clip')}<div><strong>No surveys yet</strong></div><div class="small">Start a new survey, then add photos as you walk the site.</div></div>`}
   `;
-  $('#installBtn').onclick = async () => { if (!installPrompt) return; installPrompt.prompt(); await installPrompt.userChoice; installPrompt = null; $('#installBtn').hidden = true; };
+  $('#installBtn').onclick = installApp;
   const bar = setBottomBar(`<button class="btn primary" id="newSurvey">${icon('plus')} New survey</button>`);
   $('#newSurvey', bar).onclick = newSurvey;
 }
@@ -244,7 +335,7 @@ async function viewSurvey(id) {
       <label><span>Site name</span><input id="f-site" value="${esc(s.site)}" placeholder="e.g. Plot 12, Riverside Court" autocomplete="off"></label>
       <label><span>Address / location</span><input id="f-address" value="${esc(s.address)}" autocomplete="off"></label>
       <div class="grid2">
-        <label><span>Surveyor</span><input id="f-surveyor" value="${esc(s.surveyor)}" placeholder="Your name" autocomplete="name"></label>
+        <label><span>Surveyor</span><select id="f-surveyor">${listSelect(await Settings.surveyors(), s.surveyor, 'Select surveyor…')}</select></label>
         <label><span>Date</span><input type="date" id="f-date" value="${esc(s.date)}"></label>
       </div>
       <label><span>Client / project ref</span><input id="f-client" value="${esc(s.client)}" autocomplete="off"></label>
@@ -255,18 +346,20 @@ async function viewSurvey(id) {
       : `<div class="empty">${icon('camera')}<div><strong>No photos yet</strong></div><div class="small">Tap “Add photo” to take a picture or choose from your library.</div></div>`}
   `;
 
-  const fields = ['site', 'address', 'surveyor', 'date', 'client', 'notes'];
-  for (const f of fields) {
+  const saveSurvey = () => saveLater('survey', async () => {
+    s.updatedAt = Date.now();
+    await DB.put('surveys', s);
+    if (s.surveyor) await Settings.set('surveyor', s.surveyor);
+  });
+  for (const f of ['site', 'address', 'date', 'client', 'notes']) {
     $(`#f-${f}`).addEventListener('input', e => {
       s[f] = e.target.value;
       if (f === 'site') $('#title').textContent = s.site || 'New survey';
-      saveLater('survey', async () => {
-        s.updatedAt = Date.now();
-        await DB.put('surveys', s);
-        if (s.surveyor) await Settings.set('surveyor', s.surveyor);
-      });
+      saveSurvey();
     });
   }
+  bindListSelect($('#f-surveyor'), 'surveyors', () => Settings.surveyors(), 'Select surveyor…',
+    v => { s.surveyor = v; saveSurvey(); }, 'Surveyor name to add');
 
   $('#delSurvey').onclick = async () => {
     if (!confirm(`Delete “${s.site || 'this survey'}” and all ${items.length} photo(s)? This cannot be undone.`)) return;
@@ -286,6 +379,7 @@ async function viewSurvey(id) {
 
 function itemCard(it, n, sid) {
   const tags = [];
+  if (it.discipline) tags.push(`<span class="tag disc">${esc(it.discipline)}</span>`);
   if (it.actionBy) tags.push(`<span class="tag who">${esc(it.actionBy)}</span>`);
   if (it.dueDate) tags.push(`<span class="tag ${isOverdue(it) ? 'overdue' : ''}">Due ${esc(fmtDate(it.dueDate))}</span>`);
   if (it.priority) tags.push(`<span class="tag p-${esc(it.priority)}">${esc(it.priority)}</span>`);
@@ -311,7 +405,7 @@ async function addPhotos(surveyId) {
       last = {
         id: uid(), surveyId, createdAt: t++,
         photo: await processPhoto(f), annotated: null, shapes: [],
-        location: '', comment: '', actionBy: '', dueDate: '', priority: 'Medium', status: 'Open',
+        location: '', comment: '', discipline: '', actionBy: '', dueDate: '', priority: 'Medium', status: 'Open',
       };
       await DB.put('items', last);
     }
@@ -333,7 +427,8 @@ async function viewItem(sid, iid) {
   const all = await getItems(sid);
   const n = all.findIndex(x => x.id === iid) + 1;
   const locations = [...new Set(all.map(x => x.location).filter(Boolean))];
-  let people = await Settings.people();
+  const people = await Settings.people();
+  const disciplines = await Settings.disciplines();
   setHeader(`Item #${n}`, `#/s/${sid}`, `<button class="icon-btn" id="delItem" aria-label="Delete item">${icon('trash')}</button>`);
 
   view().innerHTML = `
@@ -348,6 +443,7 @@ async function viewItem(sid, iid) {
       <label style="margin-bottom:0"><span>Comments / write-up</span><textarea id="comment" rows="4" placeholder="Describe the issue and what needs doing">${esc(it.comment)}</textarea></label>
     </section>
     <section class="card">
+      <div class="field"><span class="lbl">Discipline</span><div class="chips" id="disc"></div></div>
       <div class="field"><span class="lbl">Who to action</span><div class="chips" id="people"></div></div>
       <div class="field"><span class="lbl">Action by</span>
         <div class="chips" id="dueQuick">${DUE_QUICK.map(([l, d]) => `<button class="chip" data-d="${d}">${l}</button>`).join('')}</div>
@@ -365,24 +461,8 @@ async function viewItem(sid, iid) {
   $('#loc').oninput = e => { it.location = e.target.value; save(); };
   $('#comment').oninput = e => { it.comment = e.target.value; save(); };
 
-  function renderPeople() {
-    const list = people.includes(it.actionBy) || !it.actionBy ? people : [...people, it.actionBy];
-    $('#people').innerHTML = list.map(p => `<button class="chip ${p === it.actionBy ? 'on' : ''}" data-p="${esc(p)}">${esc(p)}</button>`).join('')
-      + `<button class="chip add" id="addPerson">+ Add</button>`;
-  }
-  renderPeople();
-  $('#people').onclick = async e => {
-    const b = e.target.closest('button'); if (!b) return;
-    if (b.id === 'addPerson') {
-      const name = (prompt('Name, company or trade to add') || '').trim();
-      if (!name) return;
-      if (!people.includes(name)) { people = [...people, name]; await Settings.set('people', people); }
-      it.actionBy = name;
-    } else {
-      it.actionBy = it.actionBy === b.dataset.p ? '' : b.dataset.p;
-    }
-    renderPeople(); save();
-  };
+  bindChipPicker($('#disc'), { get: () => it.discipline || '', set: v => { it.discipline = v; }, list: disciplines, settingsKey: 'disciplines', promptText: 'Discipline to add', onChange: save });
+  bindChipPicker($('#people'), { get: () => it.actionBy, set: v => { it.actionBy = v; }, list: people, settingsKey: 'people', promptText: 'Name, company or trade to add', onChange: save });
 
   function renderDue() {
     $$('#dueQuick .chip').forEach(c => c.classList.toggle('on', !!it.dueDate && addDays(+c.dataset.d) === it.dueDate));
@@ -588,6 +668,7 @@ function loadJsPdf() {
 
 function exportSheet(survey, items) {
   const who = [...new Set(items.map(i => i.actionBy).filter(Boolean))].sort();
+  const discs = [...new Set(items.map(i => i.discipline).filter(Boolean))].sort();
   const back = document.createElement('div');
   back.className = 'sheet-back';
   back.innerHTML = `<div class="sheet" role="dialog" aria-label="PDF report">
@@ -596,6 +677,10 @@ function exportSheet(survey, items) {
       <option value="">Everyone (${items.length} items)</option>
       ${who.map(w => `<option value="${esc(w)}">${esc(w)} only (${items.filter(i => i.actionBy === w).length})</option>`).join('')}
     </select></label>
+    ${discs.length ? `<label><span>Discipline</span><select id="x-disc">
+      <option value="">All disciplines</option>
+      ${discs.map(d => `<option value="${esc(d)}">${esc(d)} (${items.filter(i => i.discipline === d).length})</option>`).join('')}
+    </select></label>` : ''}
     <label class="check"><input type="checkbox" id="x-summary" checked> Include summary page</label>
     <label class="check"><input type="checkbox" id="x-done" checked> Include completed items</label>
     <div class="row" style="margin-top:18px">
@@ -610,12 +695,12 @@ function exportSheet(survey, items) {
   $('#x-cancel', back).onclick = close;
 
   const make = async () => {
-    const opts = { person: $('#x-who', back).value, summary: $('#x-summary', back).checked, includeDone: $('#x-done', back).checked };
+    const opts = { person: $('#x-who', back).value, discipline: $('#x-disc', back)?.value || '', summary: $('#x-summary', back).checked, includeDone: $('#x-done', back).checked };
     const done = busy('Creating PDF…');
     try {
       await loadJsPdf();
       const blob = await buildPdf(survey, items, opts);
-      const name = `Snagging - ${(survey.site || 'Survey').replace(/[\\/:*?"<>|]+/g, '-')}${opts.person ? ' - ' + opts.person.replace(/[\\/:*?"<>|]+/g, '-') : ''} - ${survey.date || today()}.pdf`;
+      const name = `Snagging - ${(survey.site || 'Survey').replace(/[\\/:*?"<>|]+/g, '-')}${[opts.discipline, opts.person].filter(Boolean).map(x => ' - ' + x.replace(/[\\/:*?"<>|]+/g, '-')).join('')} - ${survey.date || today()}.pdf`;
       return { blob, name };
     } finally { done(); }
   };
@@ -644,12 +729,17 @@ async function buildPdf(survey, allItems, opts = {}) {
   const { jsPDF } = window.jspdf;
   const doc = new jsPDF({ unit: 'mm', format: 'a4', compress: true });
   const PW = 210, PH = 297, M = 12, CW = PW - M * 2;
-  const company = await Settings.get('company', '');
+  const company = await Settings.company();
   const numbered = allItems.map((it, i) => ({ ...it, no: i + 1 }));
-  const items = numbered.filter(it => (!opts.person || it.actionBy === opts.person) && (opts.includeDone !== false || it.status !== 'Complete'));
+  const items = numbered.filter(it => (!opts.person || it.actionBy === opts.person)
+    && (!opts.discipline || it.discipline === opts.discipline)
+    && (opts.includeDone !== false || it.status !== 'Complete'));
   const PRIO = { High: [220, 38, 38], Medium: [217, 119, 6], Low: [22, 163, 74] };
-  const NAVY = [30, 41, 59], MUTED = [100, 116, 139], ACCENT = [249, 115, 22];
-  const title = opts.person ? `Snagging Report — ${opts.person}` : 'Site Survey / Snagging Report';
+  const NAVY = [17, 20, 24], MUTED = [100, 116, 139], SKY = [140, 210, 244], BLUE = [11, 111, 174], SKY_SOFT = [232, 246, 253];
+  const filterLabel = [opts.discipline, opts.person].filter(Boolean).join(' · ');
+  const title = filterLabel ? `Snagging Report — ${filterLabel}` : 'Site Survey / Snagging Report';
+  let logo = null;
+  try { logo = await blobToDataURL(await (await fetch('img/adi-logo.jpg')).blob()); } catch { /* PDF still works without the logo */ }
 
   const text = (str, x, y, { size = 10, style = 'normal', color = NAVY, align = 'left' } = {}) => {
     doc.setFont('helvetica', style); doc.setFontSize(size); doc.setTextColor(...color);
@@ -673,11 +763,12 @@ async function buildPdf(survey, allItems, opts = {}) {
   const newPage = () => {
     if (!first) doc.addPage();
     first = false;
-    doc.setFillColor(...ACCENT); doc.rect(0, 0, PW, 3, 'F');
-    if (company) text(company.toUpperCase(), M, 7, { size: 8, style: 'bold', color: MUTED });
-    text(title, M, company ? 11 : 9, { size: 14, style: 'bold' });
-    text(fitLine(survey.site || 'Untitled survey', 80, 10, 'bold'), PW - M, 8, { size: 10, style: 'bold', align: 'right' });
-    text(`Survey date: ${fmtDate(survey.date)}`, PW - M, 13.5, { size: 9, color: MUTED, align: 'right' });
+    doc.setFillColor(...SKY); doc.rect(0, 0, PW, 3, 'F');
+    if (logo) doc.addImage(logo, 'JPEG', M, 5.5, 13 * 554 / 176, 13, 'adi-logo', 'FAST');
+    else text(company, M, 9, { size: 12, style: 'bold' });
+    text(fitLine(title, 120, 13, 'bold'), PW - M, 5.5, { size: 13, style: 'bold', align: 'right' });
+    text(fitLine(survey.site || 'Untitled survey', 120, 10, 'bold'), PW - M, 11, { size: 10, style: 'bold', color: BLUE, align: 'right' });
+    text(`Survey date: ${fmtDate(survey.date)}`, PW - M, 15.8, { size: 9, color: MUTED, align: 'right' });
     doc.setDrawColor(203, 213, 225); doc.setLineWidth(0.3); doc.line(M, 21, PW - M, 21);
   };
 
@@ -686,7 +777,7 @@ async function buildPdf(survey, allItems, opts = {}) {
     newPage();
     let y = 27;
     const kv = [
-      ['Site', survey.site], ['Address / location', survey.address], ['Client / project ref', survey.client],
+      ['Company', company], ['Site', survey.site], ['Address / location', survey.address], ['Client / project ref', survey.client],
       ['Surveyor', survey.surveyor], ['Date of survey', fmtDate(survey.date)],
       ['Items in this report', `${items.length}  (${items.filter(i => i.status !== 'Complete').length} open, ${items.filter(i => i.status === 'Complete').length} complete)`],
     ];
@@ -715,6 +806,7 @@ async function buildPdf(survey, allItems, opts = {}) {
       let yy = startY;
       const head = () => {
         doc.setFillColor(...NAVY); doc.rect(M, yy, CW, 7, 'F');
+        doc.setFillColor(...SKY); doc.rect(M, yy + 6.4, CW, 0.6, 'F');
         let x = M + 2;
         for (const c of cols) { text(c.h, c.align === 'right' ? x + c.w - 4 : x, yy + 2, { size: 8, style: 'bold', color: [255, 255, 255], align: c.align || 'left' }); x += c.w; }
         yy += 7;
@@ -743,10 +835,11 @@ async function buildPdf(survey, allItems, opts = {}) {
     if (y > PH - 40) { newPage(); y = 27; }
     text('ITEM SCHEDULE', M, y, { size: 8, style: 'bold', color: MUTED }); y += 5;
     table(
-      [{ h: '#', w: 10 }, { h: 'Location', w: 34 }, { h: 'Description', w: 58 }, { h: 'Action by', w: 34 }, { h: 'Due', w: 22 }, { h: 'Status', w: CW - 158 }],
-      items.map(it => [it.no, it.location || '—', it.comment || '—', it.actionBy || '—',
+      [{ h: '#', w: 8 }, { h: 'Location', w: 27 }, { h: 'Description', w: 45 }, { h: 'Discipline', w: 23 }, { h: 'Action by', w: 28 }, { h: 'Due', w: 20 }, { h: 'Priority', w: 16 }, { h: 'Status', w: CW - 167 }],
+      items.map(it => [it.no, it.location || '—', it.comment || '—', it.discipline || '—', it.actionBy || '—',
         { v: it.dueDate ? fmtDate(it.dueDate) : '—', color: isOverdue(it) ? PRIO.High : NAVY },
-        { v: it.status === 'Complete' ? 'Complete' : `Open · ${it.priority || ''}`, color: it.status === 'Complete' ? PRIO.Low : NAVY }]), y);
+        { v: it.priority || '—', color: PRIO[it.priority] || NAVY },
+        { v: it.status === 'Complete' ? 'Complete' : 'Open', color: it.status === 'Complete' ? PRIO.Low : NAVY }]), y);
   }
 
   // ---- item pages: two per A4, photo left, write-up right
@@ -790,16 +883,17 @@ async function buildPdf(survey, allItems, opts = {}) {
       text(lines.join('\n'), TX, y, { size: 10.5, style: 'bold', color }); y += lines.length * 4.8 + 2.5;
     };
     field('Location / area', it.location);
+    field('Discipline', it.discipline);
     // action box (who + by when)
     const whoLines = wrap(it.actionBy || 'Unassigned', TW - 6, 10.5, 2);
     const dueStr = it.dueDate ? fmtDate(it.dueDate) + (isOverdue(it) ? '  (OVERDUE)' : '') : 'No date set';
     const boxH = 3 + 3.8 + whoLines.length * 4.8 + 1.5 + 3.8 + 4.8 + 2;
-    doc.setFillColor(255, 247, 237); doc.setDrawColor(...ACCENT); doc.setLineWidth(0.3);
+    doc.setFillColor(...SKY_SOFT); doc.setDrawColor(...SKY); doc.setLineWidth(0.5);
     doc.roundedRect(TX, y, TW, boxH, 1.5, 1.5, 'FD');
     let by = y + 3;
-    text('WHO TO ACTION', TX + 3, by, { size: 7.5, style: 'bold', color: [194, 65, 12] }); by += 3.8;
+    text('WHO TO ACTION', TX + 3, by, { size: 7.5, style: 'bold', color: BLUE }); by += 3.8;
     text(whoLines.join('\n'), TX + 3, by, { size: 10.5, style: 'bold' }); by += whoLines.length * 4.8 + 1.5;
-    text('ACTION BY', TX + 3, by, { size: 7.5, style: 'bold', color: [194, 65, 12] }); by += 3.8;
+    text('ACTION BY', TX + 3, by, { size: 7.5, style: 'bold', color: BLUE }); by += 3.8;
     text(dueStr, TX + 3, by, { size: 10.5, style: 'bold', color: isOverdue(it) ? PRIO.High : NAVY });
     y += boxH + 4;
 
@@ -814,8 +908,8 @@ async function buildPdf(survey, allItems, opts = {}) {
   for (let p = 1; p <= total; p++) {
     doc.setPage(p);
     doc.setDrawColor(226, 232, 240); doc.setLineWidth(0.3); doc.line(M, PH - 12, PW - M, PH - 12);
-    text(`Surveyor: ${survey.surveyor || '—'}`, M, PH - 9.5, { size: 8, color: MUTED });
-    text(`Printed ${fmtDate(today())}`, PW / 2, PH - 9.5, { size: 8, color: MUTED, align: 'center' });
+    text(fitLine(`${company ? company + ' · ' : ''}Surveyor: ${survey.surveyor || '—'}`, 90, 8), M, PH - 9.5, { size: 8, color: MUTED });
+    text(`Printed ${fmtDate(today())}`, PW / 2 + 18, PH - 9.5, { size: 8, color: MUTED, align: 'center' });
     text(`Page ${p} of ${total}`, PW - M, PH - 9.5, { size: 8, color: MUTED, align: 'right' });
   }
   return doc.output('blob');
@@ -824,17 +918,24 @@ async function buildPdf(survey, allItems, opts = {}) {
 // ---------------------------------------------------------------- settings & backup
 async function viewSettings() {
   setHeader('Settings', '#/');
-  let people = await Settings.people();
+  const LISTS = [
+    ['surveyors', 'Surveyors', 'Surveyor name', () => Settings.surveyors(), 'Shown in the surveyor drop-down on each survey.'],
+    ['disciplines', 'Disciplines', 'Discipline', () => Settings.disciplines(), 'One-tap buttons on every photo.'],
+    ['people', 'Who to action', 'Name, company or trade', () => Settings.people(), 'One-tap buttons on every photo.'],
+  ];
   view().innerHTML = `
     <section class="card">
-      <label><span>Company name (shown on PDF header)</span><input id="s-company" value="${esc(await Settings.get('company', ''))}" autocomplete="organization"></label>
-      <label style="margin-bottom:0"><span>Default surveyor name</span><input id="s-surveyor" value="${esc(await Settings.get('surveyor', ''))}" autocomplete="name"></label>
+      <label><span>Company name (shown on the PDF)</span><input id="s-company" value="${esc(await Settings.company())}" autocomplete="organization"></label>
+      <label style="margin-bottom:0"><span>Default surveyor for new surveys</span><select id="s-surveyor">${listSelect(await Settings.surveyors(), await Settings.get('surveyor', ''), 'None')}</select></label>
     </section>
-    <h2 class="section">Who to action — quick list</h2>
-    <section class="card">
-      <div class="chips" id="s-people"></div>
-      <p class="small muted" style="margin:12px 0 0">Tap a name to remove it. These appear as one-tap buttons on every photo.</p>
-    </section>
+    ${LISTS.map(([key, title, , , help]) => `
+      <h2 class="section">${title}</h2>
+      <section class="card">
+        <div class="chips" id="s-${key}"></div>
+        <p class="small muted" style="margin:12px 0 0">${help} Tap a name to remove it.</p>
+      </section>`).join('')}
+    <h2 class="section">Storage on this device</h2>
+    <section class="card" id="s-storage"><span class="small muted">Checking…</span></section>
     <h2 class="section">Backup</h2>
     <section class="card">
       <p class="small muted" style="margin-top:0">Everything is stored only on this device. Back up to a file to keep a copy or move surveys to another phone, tablet or computer.</p>
@@ -843,25 +944,42 @@ async function viewSettings() {
         <button class="btn" id="s-restore">${icon('share')} Restore file</button>
       </div>
     </section>
-    <p class="small muted" style="text-align:center">Site Snag · works offline · no sign-in</p>`;
+    <p class="small muted" style="text-align:center">adi Site Snag · works offline · no sign-in</p>`;
 
-  const renderPeople = () => {
-    $('#s-people').innerHTML = people.map(p => `<button class="chip" data-p="${esc(p)}">${esc(p)} ✕</button>`).join('') + `<button class="chip add" id="s-add">+ Add</button>`;
-  };
-  renderPeople();
-  $('#s-people').onclick = async e => {
-    const b = e.target.closest('button'); if (!b) return;
-    if (b.id === 's-add') {
-      const name = (prompt('Name, company or trade') || '').trim();
-      if (!name || people.includes(name)) return;
-      people = [...people, name];
-    } else {
-      people = people.filter(p => p !== b.dataset.p);
-    }
-    await Settings.set('people', people); renderPeople();
-  };
+  for (const [key, , promptText, getList] of LISTS) {
+    const el = $(`#s-${key}`);
+    let list = await getList();
+    const render = () => {
+      el.innerHTML = list.map(p => `<button class="chip" data-p="${esc(p)}">${esc(p)} ✕</button>`).join('') + `<button class="chip add" data-add="1">+ Add</button>`;
+    };
+    render();
+    el.onclick = async e => {
+      const b = e.target.closest('button'); if (!b) return;
+      if (b.dataset.add) {
+        const name = (prompt(promptText) || '').trim();
+        if (!name || list.includes(name)) return;
+        list = [...list, name];
+      } else {
+        if (!confirm(`Remove “${b.dataset.p}” from the list? Existing surveys keep it.`)) return;
+        list = list.filter(p => p !== b.dataset.p);
+      }
+      await Settings.set(key, list); render();
+      if (key === 'surveyors') $('#s-surveyor').innerHTML = listSelect(list, await Settings.get('surveyor', ''), 'None');
+    };
+  }
   $('#s-company').oninput = e => saveLater('company', () => Settings.set('company', e.target.value.trim()));
-  $('#s-surveyor').oninput = e => saveLater('surveyor', () => Settings.set('surveyor', e.target.value.trim()));
+  bindListSelect($('#s-surveyor'), 'surveyors', () => Settings.surveyors(), 'None',
+    v => Settings.set('surveyor', v), 'Surveyor name to add');
+
+  (async () => {
+    const items = await DB.all('items');
+    const est = navigator.storage?.estimate ? await navigator.storage.estimate() : null;
+    const mb = n => (n / 1048576).toFixed(n < 10485760 ? 1 : 0);
+    const el = $('#s-storage'); if (!el) return;
+    el.innerHTML = `<div><strong>${items.length}</strong> photo${items.length === 1 ? '' : 's'} saved${est ? ` · <strong>${mb(est.usage)} MB</strong> used` : ''}</div>
+      ${est && est.quota ? `<div class="meter"><div style="width:${Math.max(1, Math.min(100, est.usage / est.quota * 100)).toFixed(1)}%"></div></div>
+      <div class="small muted">About ${est.quota > 1073741824 ? (est.quota / 1073741824).toFixed(1) + ' GB' : mb(est.quota) + ' MB'} available to the app on this device. Each photo takes roughly 0.2–0.5 MB.</div>` : ''}`;
+  })();
 
   $('#s-backup').onclick = async () => {
     const done = busy('Preparing backup…');
@@ -873,7 +991,7 @@ async function viewSettings() {
       }
       const data = {
         app: 'site-snag', version: 1, exportedAt: new Date().toISOString(),
-        settings: { people, company: await Settings.get('company', ''), surveyor: await Settings.get('surveyor', '') },
+        settings: { people: await Settings.people(), surveyors: await Settings.surveyors(), disciplines: await Settings.disciplines(), company: await Settings.company(), surveyor: await Settings.get('surveyor', '') },
         surveys: await DB.all('surveys'), items,
       };
       const blob = new Blob([JSON.stringify(data)], { type: 'application/json' });
@@ -898,8 +1016,10 @@ async function viewSettings() {
           it.annotated = it.annotated ? await dataURLToBlob(it.annotated) : null;
           await DB.put('items', it);
         }
-        const merged = [...new Set([...people, ...(data.settings?.people || [])])];
-        await Settings.set('people', merged);
+        for (const key of ['people', 'surveyors', 'disciplines']) {
+          const mine = await Settings[key]();
+          await Settings.set(key, [...new Set([...mine, ...(data.settings?.[key] || [])])]);
+        }
         toast(`Restored ${data.surveys.length} survey(s)`);
         go('#/');
       } catch (e) { alert(e.message); } finally { done(); }
@@ -918,5 +1038,5 @@ document.addEventListener('visibilitychange', () => { if (document.visibilitySta
 // Exposed for automated tests.
 window.SiteSnag = { buildPdf, getItems, DB, loadJsPdf };
 
-route();
+seedDefaults().catch(console.warn).finally(route);
 })();
