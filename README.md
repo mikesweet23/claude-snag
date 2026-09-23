@@ -14,8 +14,8 @@ A simple, offline-first web app (PWA) for site surveys and snagging. No sign-in,
   - Then **2 photos per page**, each with its write-up beside it: location, a highlighted "Who to action / Action by" box, and comments.
   - Overdue dates show in red. Each page has a header with the site and date, and a footer with the surveyor and page numbers.
   - You can make a PDF for one person and/or one discipline only (for example, just the HVAC items) and choose whether to leave out completed items.
-  - **Save PDF** downloads the file. **Share** opens the phone's share sheet (email, WhatsApp, Files, and so on).
-- **Settings:** company name, default surveyor, the surveyor/discipline/who-to-action lists, storage used on the device, and **backup/restore** to a file (use this to move surveys between devices).
+  - Tap **Create PDF**. When it's ready, **Share** (on iPhone: *Share / Save to Files*) opens the phone's share sheet for email, WhatsApp, Files and so on. **Download** and **Open PDF** also work.
+- **Settings:** company name, default surveyor, the surveyor/discipline/who-to-action lists, storage used on the device, and **backup/restore** to a file (use this to move surveys between devices). Each survey also has a **Back up this survey** button.
 
 ## Running it
 
@@ -36,6 +36,14 @@ Installing: tap **Install app on this device** on the home screen. On Android/Ch
 
 There's no limit set in the app on the number of photos or their file size. Photos are shrunk to 1600px when added, which is about 0.2–0.5 MB each. The only real limit is the storage the phone lets the browser use. That's usually several GB on modern phones, i.e. thousands of photos (Settings shows usage). Very large PDFs (100+ photos) can take a while on older phones; splitting by discipline or person helps.
 
+## Reliability notes
+
+- **Photo storage.** Photos are saved as raw bytes in IndexedDB, not as Blobs. Safari on iPhone/iPad can lose the file behind a stored Blob, which caused *"The object can not be found here"* when making a PDF in the first versions. Data from those versions is moved over automatically the first time the new version opens. Any photo that can't be recovered shows as *Photo unavailable* and keeps its write-up; use **Replace** to add the photo again.
+- **Sharing.** The PDF is built first, then the Share/Download buttons appear. iPhones block sharing that starts after a long task, so it has to begin with its own tap.
+- **Large surveys.** Lists load small thumbnails. PDFs and backups are built one photo at a time with progress shown, so long reports don't run the phone out of memory. The test adds 30 photos at once and builds a 19-page PDF.
+- **iPhone data safety.** Safari can clear data for websites that haven't been opened for 7 days. Apps installed to the Home Screen are exempt, so the app shows a reminder until it's installed.
+- **Errors** such as a full phone are shown as plain-English messages instead of failing silently.
+
 ## Notes
 
 - Data lives in the browser's IndexedDB on each device. Deleting the app or clearing site data erases it, so use **Settings → Back up all** regularly.
@@ -45,7 +53,13 @@ There's no limit set in the app on the number of photos or their file size. Phot
 
 ## Testing
 
-`tests/e2e.mjs` is an end-to-end Playwright test. It creates a survey, adds three photos, marks one up, assigns people and dates, exports the PDF, and checks the data is still there after a reload.
+`tests/e2e.mjs` is an end-to-end Playwright test. It covers:
+
+- creating a survey, adding photos, marking up and assigning people and dates;
+- exporting the PDF and checking the data is still there after a reload;
+- a backup, delete and restore round trip;
+- adding 30 photos at once and building a large PDF;
+- upgrading data saved by the first version.
 
 ```bash
 python3 -m http.server 8080 &
