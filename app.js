@@ -109,8 +109,9 @@ const DB = {
   byIndex: (s, i, v) => run(s, 'readonly', st => st.index(i).getAll(v)),
 };
 const DEFAULT_PEOPLE = ['Main Contractor', 'Electrician', 'Plumber', 'Joiner', 'Decorator', 'Client'];
-const DEFAULT_SURVEYORS = ['Paul Bonner', 'Paul Heaton', 'Kass Weetman', 'Alex Slattery', 'Mike Slattery', 'Stuart Clements'];
-const DEFAULT_DISCIPLINES = ['HVAC', 'Plumbing', 'Pipework', 'CAD', 'Engineering'];
+const DEFAULT_SURVEYORS = ['Paul Bonner', 'Paul Heaton', 'Kass Weetman', 'Alex Slattery', 'Mike Slattery', 'Stuart Clements', 'Mike Sweet'];
+const DEFAULT_DISCIPLINES = ['HVAC', 'Plumbing', 'Mechanical', 'Electrical', 'BMS', 'Building', 'Civils', 'Commissioning & Testing', 'AC', 'Ventilation'];
+const OLD_DISCIPLINES = ['HVAC', 'Plumbing', 'Pipework', 'CAD', 'Engineering'];   // defaults before v4
 const DEFAULT_COMPANY = 'adi Climate Systems Limited';
 const Settings = {
   async get(k, def) { const v = await DB.get('kv', k); return v === undefined ? def : v; },
@@ -122,9 +123,19 @@ const Settings = {
 };
 // One-off upgrade for devices that used the first version (company was blank then).
 async function seedDefaults() {
-  if ((await Settings.get('seed', 0)) >= 2) return;
-  if (!(await Settings.get('company', ''))) await Settings.set('company', DEFAULT_COMPANY);
-  await Settings.set('seed', 2);
+  const seed = await Settings.get('seed', 0);
+  if (seed < 2 && !(await Settings.get('company', ''))) await Settings.set('company', DEFAULT_COMPANY);
+  // v3: add names to the default surveyor list for devices that already saved their own copy.
+  if (seed < 3) {
+    const saved = await Settings.get('surveyors');
+    if (saved && !saved.includes('Mike Sweet')) await Settings.set('surveyors', [...saved, 'Mike Sweet']);
+  }
+  // v4: new default trade list; keep any the user added themselves.
+  if (seed < 4) {
+    const saved = await Settings.get('disciplines');
+    if (saved) await Settings.set('disciplines', [...DEFAULT_DISCIPLINES, ...saved.filter(d => !OLD_DISCIPLINES.includes(d) && !DEFAULT_DISCIPLINES.includes(d))]);
+  }
+  if (seed < 4) await Settings.set('seed', 4);
 }
 
 // <select> with an "Add another…" option that prompts for a new name and remembers it.
@@ -834,15 +845,18 @@ function exportSheet(survey, items) {
   back.className = 'sheet-back';
   back.innerHTML = `<div class="sheet" role="dialog" aria-label="PDF report">
     <h3>PDF report</h3>
+    <div class="field"><span class="lbl">Type</span><div class="seg" id="x-type">
+      <button data-v="report" class="on">Report</button><button data-v="signoff">Contractor sign-off</button></div>
+      <p class="small muted" id="x-type-help" style="margin:8px 0 0"></p></div>
     <label><span>Include items for</span><select id="x-who">
       <option value="">Everyone (${items.length} items)</option>
       ${who.map(w => `<option value="${esc(w)}">${esc(w)} only (${items.filter(i => i.actionBy === w).length})</option>`).join('')}
     </select></label>
-    ${discs.length ? `<label><span>Discipline</span><select id="x-disc">
+    ${discs.length ? `<label><span id="x-disc-label">Discipline</span><select id="x-disc">
       <option value="">All disciplines</option>
       ${discs.map(d => `<option value="${esc(d)}">${esc(d)} (${items.filter(i => i.discipline === d).length})</option>`).join('')}
     </select></label>` : ''}
-    <label class="check"><input type="checkbox" id="x-summary" checked> Include summary page</label>
+    <label class="check"><input type="checkbox" id="x-summary" checked> <span id="x-summary-label" style="all:unset">Include summary page</span></label>
     <label class="check"><input type="checkbox" id="x-done" checked> Include completed items</label>
     <button class="btn primary block" id="x-make" style="margin-top:18px">${icon('file')} Create PDF</button>
     <button class="btn block" id="x-cancel">Cancel</button>
@@ -851,9 +865,25 @@ function exportSheet(survey, items) {
   back.onclick = e => { if (e.target === back) back.remove(); };
   $('#x-cancel', back).onclick = () => back.remove();
 
+  let type = 'report';
+  const paintType = () => {
+    $$('#x-type button', back).forEach(b => b.classList.toggle('on', b.dataset.v === type));
+    const signoff = type === 'signoff';
+    $('#x-type-help', back).textContent = signoff
+      ? 'A fillable PDF for the contractor: tick Completed, add comments, name, date and signature for each item, then send it back. Pick a discipline to send only that trade’s items.'
+      : 'A read-only report with photos and write-ups.';
+    $('#x-summary-label', back).textContent = signoff ? 'Include cover page (instructions & final sign-off)' : 'Include summary page';
+    if ($('#x-disc-label', back)) $('#x-disc-label', back).textContent = signoff ? 'Send to discipline / trade' : 'Discipline';
+    $('#x-done', back).checked = !signoff;   // sign-off sheets normally only need open items
+  };
+  paintType();
+  $('#x-type', back).onclick = e => { const b = e.target.closest('button'); if (!b) return; type = b.dataset.v; paintType(); };
+
   $('#x-make', back).onclick = async () => {
-    const opts = { person: $('#x-who', back).value, discipline: $('#x-disc', back)?.value || '', summary: $('#x-summary', back).checked, includeDone: $('#x-done', back).checked };
-    const name = `Snagging - ${safeName(survey.site || 'Survey')}${[opts.discipline, opts.person].filter(Boolean).map(x => ' - ' + safeName(x)).join('')} - ${survey.date || today()}.pdf`;
+    const opts = { signoff: type === 'signoff', person: $('#x-who', back).value, discipline: $('#x-disc', back)?.value || '', summary: $('#x-summary', back).checked, includeDone: $('#x-done', back).checked };
+    const count = items.filter(it => (!opts.person || it.actionBy === opts.person) && (!opts.discipline || it.discipline === opts.discipline) && (opts.includeDone || it.status !== 'Complete')).length;
+    if (!count) { alert('No items match those choices. Try including completed items or choosing a different discipline or person.'); return; }
+    const name = `${opts.signoff ? 'Sign-off' : 'Snagging'} - ${safeName(survey.site || 'Survey')}${[opts.discipline, opts.person].filter(Boolean).map(x => ' - ' + safeName(x)).join('')} - ${survey.date || today()}.pdf`;
     const done = busy('Creating PDF…');
     let blob;
     try {
@@ -896,7 +926,8 @@ function offerFile(blob, name, heading) {
 
 async function buildPdf(survey, allItems, opts = {}, onProgress = () => {}) {
   const { jsPDF } = window.jspdf;
-  const doc = new jsPDF({ unit: 'mm', format: 'a4', compress: true });
+  // jsPDF writes form fields incorrectly when compression is on, so sign-off sheets are left uncompressed.
+  const doc = new jsPDF({ unit: 'mm', format: 'a4', compress: !opts.signoff });
   const PW = 210, PH = 297, M = 12, CW = PW - M * 2;
   const company = await Settings.company();
   const numbered = allItems.map((it, i) => ({ ...it, no: i + 1 }));
@@ -906,7 +937,23 @@ async function buildPdf(survey, allItems, opts = {}, onProgress = () => {}) {
   const PRIO = { High: [220, 38, 38], Medium: [217, 119, 6], Low: [22, 163, 74] };
   const NAVY = [17, 20, 24], MUTED = [100, 116, 139], SKY = [140, 210, 244], BLUE = [11, 111, 174], SKY_SOFT = [232, 246, 253];
   const filterLabel = [opts.discipline, opts.person].filter(Boolean).join(' · ');
-  const title = filterLabel ? `Snagging Report — ${filterLabel}` : 'Site Survey / Snagging Report';
+  const title = opts.signoff
+    ? (filterLabel ? `Contractor Sign-off — ${filterLabel}` : 'Contractor Sign-off Sheet')
+    : (filterLabel ? `Snagging Report — ${filterLabel}` : 'Site Survey / Snagging Report');
+  // Fillable form fields (sign-off sheets). A white box is drawn behind each so it prints clearly.
+  const formBox = (x, y, w, h) => { doc.setFillColor(255, 255, 255); doc.setDrawColor(148, 163, 184); doc.setLineWidth(0.3); doc.rect(x, y, w, h, 'FD'); };
+  const textField = (name, x, y, w, h, { multiline = false, size = 9 } = {}) => {
+    formBox(x, y, w, h);
+    const f = new doc.AcroFormTextField();
+    Object.assign(f, { fieldName: name, x, y, width: w, height: h, fontSize: size, multiline, value: '' });
+    doc.addField(f);
+  };
+  const checkBox = (name, x, y, sz) => {
+    formBox(x, y, sz, sz);
+    const f = new doc.AcroFormCheckBox();
+    Object.assign(f, { fieldName: name, x, y, width: sz, height: sz, appearanceState: 'Off', value: 'Off' });
+    doc.addField(f);
+  };
   let logo = null;
   try { logo = new Uint8Array(await (await fetch('img/adi-logo.jpg')).arrayBuffer()); } catch { /* PDF still works without the logo */ }
 
@@ -945,6 +992,20 @@ async function buildPdf(survey, allItems, opts = {}, onProgress = () => {}) {
   if (opts.summary !== false) {
     newPage();
     let y = 27;
+    if (opts.signoff) {
+      const steps = [
+        'Open this PDF in Adobe Acrobat Reader (free) or your phone/computer PDF viewer.',
+        'For each item: tick Completed, add any comments, your name and the date, and sign in the Signature box (type your name, or use the app\'s Sign / Fill & Sign tool).',
+        `Complete the final sign-off at the end of this page, save the PDF and send it back to ${survey.surveyor || 'the surveyor'}${company ? ' at ' + company : ''}.`,
+      ];
+      const lines = steps.map((st, i) => wrap(`${i + 1}.  ${st}`, CW - 8, 9.5, 3));
+      const boxH = 9 + lines.reduce((n, l) => n + l.length * 4.3 + 1.5, 0);
+      doc.setFillColor(...SKY_SOFT); doc.setDrawColor(...SKY); doc.setLineWidth(0.5); doc.roundedRect(M, y, CW, boxH, 2, 2, 'FD');
+      text('HOW TO COMPLETE THIS SHEET', M + 4, y + 3.5, { size: 8, style: 'bold', color: BLUE });
+      let iy = y + 8.5;
+      for (const l of lines) { text(l.join('\n'), M + 4, iy, { size: 9.5 }); iy += l.length * 4.3 + 1.5; }
+      y += boxH + 6;
+    }
     const kv = [
       ['Company', company], ['Site', survey.site], ['Address / location', survey.address], ['Client / project ref', survey.client],
       ['Surveyor', survey.surveyor], ['Date of survey', fmtDate(survey.date)],
@@ -1003,12 +1064,29 @@ async function buildPdf(survey, allItems, opts = {}, onProgress = () => {}) {
 
     if (y > PH - 40) { newPage(); y = 27; }
     text('ITEM SCHEDULE', M, y, { size: 8, style: 'bold', color: MUTED }); y += 5;
-    table(
+    const scheduleEnd = table(
       [{ h: '#', w: 8 }, { h: 'Location', w: 27 }, { h: 'Description', w: 45 }, { h: 'Discipline', w: 23 }, { h: 'Action by', w: 28 }, { h: 'Due', w: 20 }, { h: 'Priority', w: 16 }, { h: 'Status', w: CW - 167 }],
       items.map(it => [it.no, it.location || '—', it.comment || '—', it.discipline || '—', it.actionBy || '—',
         { v: it.dueDate ? fmtDate(it.dueDate) : '—', color: isOverdue(it) ? PRIO.High : NAVY },
         { v: it.priority || '—', color: PRIO[it.priority] || NAVY },
         { v: it.status === 'Complete' ? 'Complete' : 'Open', color: it.status === 'Complete' ? PRIO.Low : NAVY }]), y);
+    if (opts.signoff) {
+      // final declaration for the whole sheet
+      let dy = Math.max(scheduleEnd + 8, 0);
+      if (dy + 52 > PH - 16) { newPage(); dy = 27; }
+      doc.setFillColor(...SKY_SOFT); doc.setDrawColor(...SKY); doc.setLineWidth(0.5); doc.roundedRect(M, dy, CW, 50, 2, 2, 'FD');
+      text('FINAL SIGN-OFF', M + 4, dy + 3.5, { size: 8, style: 'bold', color: BLUE });
+      text(wrap(`I confirm the items marked Completed in this sheet${filterLabel ? ' (' + filterLabel + ')' : ''} have been carried out.`, CW - 8, 9.5, 2).join('\n'), M + 4, dy + 8.5, { size: 9.5 });
+      const cw = (CW - 12) / 2;
+      text('Company', M + 4, dy + 17, { size: 7.5, style: 'bold', color: MUTED });
+      textField('final_company', M + 4, dy + 20.5, cw, 7);
+      text('Name', M + 8 + cw, dy + 17, { size: 7.5, style: 'bold', color: MUTED });
+      textField('final_name', M + 8 + cw, dy + 20.5, cw, 7);
+      text('Signature', M + 4, dy + 30, { size: 7.5, style: 'bold', color: MUTED });
+      textField('final_signature', M + 4, dy + 33.5, cw, 12, { size: 12 });
+      text('Date', M + 8 + cw, dy + 30, { size: 7.5, style: 'bold', color: MUTED });
+      textField('final_date', M + 8 + cw, dy + 33.5, cw * 0.6, 7);
+    }
   }
 
   // ---- item pages: two per A4, photo left, write-up right
@@ -1057,7 +1135,7 @@ async function buildPdf(survey, allItems, opts = {}, onProgress = () => {}) {
       text(lines.join('\n'), TX, y, { size: 10.5, style: 'bold', color }); y += lines.length * 4.8 + 2.5;
     };
     field('Location / area', it.location);
-    field('Discipline', it.discipline);
+    if (!(opts.signoff && opts.discipline)) field('Discipline', it.discipline);
     // action box (who + by when)
     const whoLines = wrap(it.actionBy || 'Unassigned', TW - 6, 10.5, 2);
     const dueStr = it.dueDate ? fmtDate(it.dueDate) + (isOverdue(it) ? '  (OVERDUE)' : '') : 'No date set';
@@ -1071,8 +1149,29 @@ async function buildPdf(survey, allItems, opts = {}, onProgress = () => {}) {
     text(dueStr, TX + 3, by, { size: 10.5, style: 'bold', color: isOverdue(it) ? PRIO.High : NAVY });
     y += boxH + 4;
 
+    // contractor sign-off block, anchored to the bottom of the write-up column
+    const SIGN_H = 53;
+    const textBottom = opts.signoff ? y0 + h - SIGN_H - 3 : y0 + h;
+    if (opts.signoff) {
+      const sy = y0 + h - SIGN_H, f = `item${it.no}_`;
+      doc.setFillColor(248, 250, 252); doc.setDrawColor(...NAVY); doc.setLineWidth(0.4);
+      doc.roundedRect(TX, sy, TW, SIGN_H, 1.5, 1.5, 'FD');
+      text('CONTRACTOR SIGN-OFF', TX + 3, sy + 2.5, { size: 7.5, style: 'bold', color: BLUE });
+      checkBox(f + 'completed', TX + 3, sy + 7, 5);
+      text('Completed', TX + 10, sy + 7.8, { size: 10, style: 'bold' });
+      text('Comments', TX + 3, sy + 14, { size: 7, style: 'bold', color: MUTED });
+      textField(f + 'comments', TX + 3, sy + 17, TW - 6, 10, { multiline: true, size: 8 });
+      const nw = (TW - 6) * 0.62, dw = TW - 6 - nw - 2;
+      text('Name', TX + 3, sy + 29, { size: 7, style: 'bold', color: MUTED });
+      textField(f + 'name', TX + 3, sy + 32, nw, 6.5);
+      text('Date', TX + 5 + nw, sy + 29, { size: 7, style: 'bold', color: MUTED });
+      textField(f + 'date', TX + 5 + nw, sy + 32, dw, 6.5);
+      text('Signature', TX + 3, sy + 40, { size: 7, style: 'bold', color: MUTED });
+      textField(f + 'signature', TX + 3, sy + 43, TW - 6, 8, { size: 11 });
+    }
+
     text('COMMENTS', TX, y, { size: 7.5, style: 'bold', color: MUTED }); y += 3.8;
-    const maxLines = Math.max(1, Math.floor((y0 + h - y) / 4.4));
+    const maxLines = Math.max(1, Math.floor((textBottom - y) / 4.4));
     const lines = wrap(it.comment || '—', TW, 10, maxLines);
     text(lines.join('\n'), TX, y, { size: 10 });
   }
