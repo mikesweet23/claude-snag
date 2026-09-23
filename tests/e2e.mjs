@@ -37,7 +37,9 @@ const photos = [await makePhoto(2000, 1500, 'Photo1'), await makePhoto(1500, 200
 await page.click('#newSurvey');
 await page.fill('#f-site', 'Plot 12, Riverside Court');
 await page.fill('#f-address', '1 River Lane, Leeds');
-await page.fill('#f-surveyor', 'Mike Sweet');
+const surveyors = await page.$$eval('#f-surveyor option', o => o.map(x => x.textContent));
+if (!surveyors.includes('Stuart Clements')) throw new Error('Surveyor list missing defaults: ' + surveyors);
+await page.selectOption('#f-surveyor', 'Mike Slattery');
 await page.fill('#f-client', 'ACME Homes / J1234');
 await page.fill('#f-notes', 'Pre-handover snagging walk-round.');
 await page.screenshot({ path: `${OUT}/1-survey.png` });
@@ -48,6 +50,7 @@ await chooser.setFiles(photos[0]);
 await page.waitForSelector('#comment');
 await page.fill('#loc', 'Kitchen');
 await page.fill('#comment', 'Cracked tile behind sink. Replace tile and re-grout; check sealant around worktop is continuous.');
+await page.click('#disc button[data-p="HVAC"]');
 await page.click('#people button[data-p="Plumber"]');
 await page.click('#dueQuick button[data-d="7"]');
 await page.click('#prio button[data-v="High"]');
@@ -79,6 +82,7 @@ await page.click('.item-card >> nth=1');
 await page.waitForSelector('#comment');
 await page.fill('#loc', 'Bedroom 2');
 await page.fill('#comment', 'Door catches on frame when closing. Plane door edge and re-hang. '.repeat(6));
+await page.click('#disc button[data-p="Pipework"]');
 await page.click('#people button[data-p="Joiner"]');
 await page.click('#dueQuick button[data-d="0"]');
 await page.click('#doneBtn');
@@ -86,7 +90,7 @@ await page.waitForSelector('.item-card');
 await page.click('.item-card >> nth=2');
 await page.waitForSelector('#comment');
 await page.fill('#comment', 'Paint touch-up on skirting.');
-await page.click('#addPerson'); // prompt -> "Site Manager"
+await page.click('#people [data-add]'); // prompt -> "Site Manager"
 await page.click('#status button[data-v="Complete"]');
 await page.click('#doneBtn');
 await page.waitForSelector('.item-card');
@@ -106,6 +110,14 @@ await page.waitForSelector('.survey-card');
 const home = await page.textContent('.survey-card');
 console.log('Home card:', home.replace(/\s+/g, ' ').trim());
 await page.screenshot({ path: `${OUT}/5-home.png` });
+await page.click('#installBtn');
+await page.waitForSelector('.install-steps');
+await page.screenshot({ path: `${OUT}/6-install-help.png` });
+await page.click('#ih-ok');
+await page.goto(BASE + '#/settings');
+await page.waitForSelector('#s-storage strong');
+if (await page.inputValue('#s-company') !== 'adi Climate Systems Limited') throw new Error('Company default not set');
+await page.screenshot({ path: `${OUT}/7-settings.png`, fullPage: true });
 
 if (errors.length) { console.error('Page errors:', errors); process.exitCode = 1; }
 await browser.close();
