@@ -39,7 +39,7 @@ There's no limit set in the app on the number of photos or their file size. Phot
 ## Notes
 
 - Data lives in the browser's IndexedDB on each device. Deleting the app or clearing site data erases it, so use **Settings → Back up all** regularly.
-- Photos are resized to 1600px on import to keep storage and PDF sizes small (roughly 40KB per page).
+- Photos are resized to 1600px on import to keep storage and PDF sizes small.
 - When you change any files, bump `VERSION` in `sw.js` so installed copies pick up the update.
 - PDFs are generated on the device with [jsPDF](https://github.com/parallax/jsPDF) (MIT), which is vendored in `vendor/`.
 
