@@ -46,22 +46,32 @@ function busy(msg) {
   el.className = 'busy';
   el.innerHTML = `<div><span class="spinner"></span><span>${esc(msg)}</span></div>`;
   document.body.appendChild(el);
-  return () => el.remove();
+  const close = () => el.remove();
+  close.set = m => { el.querySelector('span:last-child').textContent = m; };
+  return close;
 }
 
 // ---------------------------------------------------------------- storage (IndexedDB)
 let dbPromise;
 function openDb() {
   return dbPromise ||= new Promise((res, rej) => {
-    const r = indexedDB.open('site-snag', 1);
-    r.onupgradeneeded = () => {
+    const r = indexedDB.open('site-snag', 2);
+    r.onupgradeneeded = e => {
       const db = r.result;
-      db.createObjectStore('surveys', { keyPath: 'id' });
-      db.createObjectStore('items', { keyPath: 'id' }).createIndex('surveyId', 'surveyId');
-      db.createObjectStore('kv');
+      if (e.oldVersion < 1) {
+        db.createObjectStore('surveys', { keyPath: 'id' });
+        db.createObjectStore('items', { keyPath: 'id' }).createIndex('surveyId', 'surveyId');
+        db.createObjectStore('kv');
+      }
+      if (e.oldVersion < 2) db.createObjectStore('images');   // photo bytes, see "images" below
     };
-    r.onsuccess = () => res(r.result);
-    r.onerror = () => rej(r.error);
+    r.onblocked = () => alert('adi Site Snag is open in another tab or window. Close it so the app can finish updating.');
+    r.onsuccess = () => {
+      const db = r.result;
+      db.onversionchange = () => { db.close(); location.reload(); };   // a newer version opened elsewhere
+      res(db);
+    };
+    r.onerror = () => { dbPromise = null; rej(r.error); };
   });
 }
 function run(storeName, mode, fn) {
@@ -72,6 +82,24 @@ function run(storeName, mode, fn) {
     tx.onerror = () => rej(tx.error);
     tx.onabort = () => rej(tx.error || new Error('Storage transaction aborted'));
   }));
+}
+// Several writes across stores that must all succeed or all fail.
+function write(stores, fn) {
+  return openDb().then(db => new Promise((res, rej) => {
+    const tx = db.transaction(stores, 'readwrite');
+    fn(name => tx.objectStore(name));
+    tx.oncomplete = () => res();
+    tx.onerror = () => rej(tx.error);
+    tx.onabort = () => rej(tx.error || new Error('Storage transaction aborted'));
+  }));
+}
+// Plain-English messages for the errors people can actually hit on site.
+function friendly(e) {
+  const name = e?.name || '', msg = e?.message || String(e || 'Something went wrong');
+  if (name === 'QuotaExceededError' || /quota/i.test(msg)) return 'This device has run out of storage space for the app. Back up and delete old surveys, or free up space on the phone, then try again.';
+  if (name === 'NotAllowedError') return 'The phone blocked that action. Please tap the button again.';
+  if (name === 'NotFoundError') return 'A saved photo could not be read from storage. Close and reopen the app, then try again.';
+  return msg;
 }
 const DB = {
   get: (s, k) => run(s, 'readonly', st => st.get(k)),
@@ -168,6 +196,15 @@ async function flushSaves() {
 }
 
 // ---------------------------------------------------------------- images
+// Photos are kept as raw bytes (ArrayBuffer) in the "images" store under "<itemId>:photo",
+// "<itemId>:mark" (the marked-up copy) and "<itemId>:thumb". Blobs are deliberately NOT stored in
+// IndexedDB: Safari on iPhone/iPad can lose the file behind a stored Blob, and reading it then fails
+// with "NotFoundError: The object can not be found here."
+const THUMB = 360;
+const imgKey = (id, kind) => `${id}:${kind}`;
+const recBlob = rec => new Blob([rec.data], { type: rec.type || 'image/jpeg' });
+const MISSING = 'data:image/svg+xml,' + encodeURIComponent('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 160 120"><rect width="160" height="120" fill="#e2e8f0"/><text x="80" y="64" font-family="sans-serif" font-size="12" fill="#64748b" text-anchor="middle">Photo unavailable</text></svg>');
+
 function blobToImage(blob) {
   return new Promise((res, rej) => {
     const url = URL.createObjectURL(blob);
@@ -177,27 +214,111 @@ function blobToImage(blob) {
     img.src = url;
   });
 }
-const canvasToBlob = (c, type = 'image/jpeg', q = 0.86) => new Promise(res => c.toBlob(res, type, q));
+async function canvasToBlob(c, type = 'image/jpeg', q = 0.86) {
+  const b = await new Promise(res => c.toBlob(res, type, q));
+  if (!b) throw new Error('The device ran low on memory while processing the photo. Close other apps and try again.');
+  return b;
+}
+// iOS caps total canvas memory; release canvases as soon as we're done with them.
+const freeCanvas = c => { c.width = c.height = 0; };
+async function blobBytes(blob) {
+  if (blob.arrayBuffer) { try { return await blob.arrayBuffer(); } catch { /* try FileReader */ } }
+  return new Promise((res, rej) => {
+    const r = new FileReader(); r.onload = () => res(r.result); r.onerror = () => rej(r.error); r.readAsArrayBuffer(blob);
+  });
+}
 const blobToDataURL = blob => new Promise((res, rej) => {
   const r = new FileReader(); r.onload = () => res(r.result); r.onerror = () => rej(r.error); r.readAsDataURL(blob);
 });
-const dataURLToBlob = async d => (await fetch(d)).blob();
+function dataURLToBlob(d) {
+  const [head, b64] = d.split(',');
+  const bin = atob(b64), u = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) u[i] = bin.charCodeAt(i);
+  return new Blob([u], { type: (head.match(/data:([^;]+)/) || [])[1] || 'image/jpeg' });
+}
 
-// Shrink camera photos so storage and PDFs stay small (EXIF rotation is applied by the browser).
+// Scale an image/canvas to fit `max` px and encode it as a JPEG record.
+async function encodeImage(src, max, q = 0.86) {
+  const sw = src.naturalWidth || src.width, sh = src.naturalHeight || src.height;
+  const s = Math.min(1, max / Math.max(sw, sh));
+  const c = document.createElement('canvas');
+  c.width = Math.max(1, Math.round(sw * s)); c.height = Math.max(1, Math.round(sh * s));
+  try {
+    c.getContext('2d').drawImage(src, 0, 0, c.width, c.height);
+    return { type: 'image/jpeg', data: await blobBytes(await canvasToBlob(c, 'image/jpeg', q)), w: c.width, h: c.height };
+  } finally { freeCanvas(c); }
+}
+// New photo from camera/library: shrink to 1600px (EXIF rotation is applied by the browser) + thumbnail.
 async function processPhoto(file) {
   const img = await blobToImage(file);
-  const max = 1600;
-  const s = Math.min(1, max / Math.max(img.naturalWidth, img.naturalHeight));
-  const c = document.createElement('canvas');
-  c.width = Math.round(img.naturalWidth * s);
-  c.height = Math.round(img.naturalHeight * s);
-  c.getContext('2d').drawImage(img, 0, 0, c.width, c.height);
-  return canvasToBlob(c);
+  return { photo: await encodeImage(img, 1600), thumb: await encodeImage(img, THUMB, 0.8) };
+}
+// Recover an image from an old/imported Blob as safely as possible; null if it's unreadable.
+async function rescueImage(blob) {
+  if (!blob) return null;
+  try {
+    const data = await blobBytes(blob);
+    const type = /png/.test(blob.type) ? 'image/png' : 'image/jpeg';
+    const img = await blobToImage(new Blob([data], { type }));
+    return { img, rec: { type, data, w: img.naturalWidth, h: img.naturalHeight } };
+  } catch { /* bytes unreadable – try decoding directly */ }
+  try { const img = await blobToImage(blob); return { img, rec: await encodeImage(img, 1600) }; } catch { return null; }
+}
+const Images = {
+  get: (id, kind) => DB.get('images', imgKey(id, kind)),
+  // What to show / print: the marked-up copy if there is one, otherwise the photo.
+  async display(it) { return (it.hasMark && await this.get(it.id, 'mark')) || this.get(it.id, 'photo'); },
+};
+// Save item metadata and any image records together. recs: { photo, mark, thumb }; null deletes.
+function saveItem(it, recs = {}) {
+  return write(['items', 'images'], st => {
+    st('items').put(it);
+    for (const [kind, rec] of Object.entries(recs)) {
+      if (rec) st('images').put(rec, imgKey(it.id, kind)); else st('images').delete(imgKey(it.id, kind));
+    }
+  });
+}
+function deleteItems(ids) {
+  return write(['items', 'images'], st => {
+    for (const id of ids) {
+      st('items').delete(id);
+      for (const kind of ['photo', 'mark', 'thumb']) st('images').delete(imgKey(id, kind));
+    }
+  });
+}
+// Store an item whose pictures arrive as Blobs (v1 data or a backup file).
+async function importItem(it, photoBlob, markBlob) {
+  const photo = await rescueImage(photoBlob);
+  const mark = markBlob ? await rescueImage(markBlob) : null;
+  delete it.photo; delete it.annotated;
+  const recs = { photo: (photo || mark)?.rec || null, mark: photo && mark ? mark.rec : null };
+  it.hasMark = !!recs.mark;
+  if (!photo && mark) it.shapes = [];           // the marked-up copy becomes the photo
+  it.photoMissing = !recs.photo;
+  const src = mark || photo;
+  recs.thumb = src ? await encodeImage(src.img, THUMB, 0.8) : null;
+  await saveItem(it, recs);
+  return !it.photoMissing;
+}
+// v1 kept Blobs inside item records; move them into the images store once.
+async function migrateV1Photos() {
+  const old = (await DB.all('items')).filter(it => 'photo' in it || 'annotated' in it);
+  if (!old.length) return;
+  const done = busy(`Updating photo storage (0 of ${old.length})…`);
+  let lost = 0;
+  try {
+    for (let i = 0; i < old.length; i++) {
+      done.set(`Updating photo storage (${i + 1} of ${old.length})…`);
+      if (!(await importItem(old[i], old[i].photo, old[i].annotated))) lost++;
+    }
+  } finally { done(); }
+  if (lost) alert(`${lost} photo(s) could not be recovered from this device's storage and are shown as “Photo unavailable”. Their write-ups are kept – use “Replace” on the item to add the photo again.`);
 }
 
 // Object URLs created for the current screen; released on navigation.
 let liveUrls = [];
 function urlFor(blob) { const u = URL.createObjectURL(blob); liveUrls.push(u); return u; }
+const urlForRec = rec => (rec ? urlFor(recBlob(rec)) : MISSING);
 function releaseUrls() { liveUrls.forEach(u => URL.revokeObjectURL(u)); liveUrls = []; }
 
 // Hidden file picker (on phones the OS offers camera or library).
@@ -244,7 +365,7 @@ async function route() {
     return await viewHome();
   } catch (e) {
     console.error(e);
-    view().innerHTML = `<div class="empty">Something went wrong: ${esc(e.message)}<br><br><a class="btn" href="#/">Home</a></div>`;
+    view().innerHTML = `<div class="empty">Something went wrong: ${esc(friendly(e))}<br><br><a class="btn" href="#/">Home</a></div>`;
   }
 }
 window.addEventListener('hashchange', route);
@@ -254,6 +375,7 @@ const go = h => { if (location.hash === h) route(); else location.hash = h; };
 let installPrompt = null;
 window.addEventListener('beforeinstallprompt', e => { e.preventDefault(); installPrompt = e; });
 window.addEventListener('appinstalled', () => { installPrompt = null; $('#installBtn')?.setAttribute('hidden', ''); toast('App installed'); });
+const isIOS = () => /iPad|iPhone|iPod/.test(navigator.userAgent) || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
 const isInstalled = () => matchMedia('(display-mode: standalone)').matches || navigator.standalone === true;
 
 async function installApp() {
@@ -268,7 +390,7 @@ async function installApp() {
 }
 function showInstallHelp() {
   const ua = navigator.userAgent;
-  const ios = /iPad|iPhone|iPod/.test(ua) || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
+  const ios = isIOS();
   const steps = ios
     ? (/CriOS|FxiOS|EdgiOS/.test(ua)
       ? ['Tap the <strong>Share</strong> button (square with an up arrow) in the address bar.', 'Choose <strong>Add to Home Screen</strong>. If it is not listed, open this page in <strong>Safari</strong> and try again.']
@@ -296,6 +418,7 @@ async function viewHome() {
   }
   view().innerHTML = `
     <div class="brand"><img src="img/adi-logo.jpg" alt="adi Climate Systems"><div class="brand-app">Site Survey<br>&amp; Snagging</div></div>
+    ${!isInstalled() && isIOS() ? `<div class="card warn small"><strong>Keep your surveys safe:</strong> on iPhone/iPad, Safari can delete data for websites that aren't opened for 7 days. Install the app to your Home Screen to prevent this.</div>` : ''}
     <button id="installBtn" class="btn block" ${isInstalled() ? 'hidden' : ''} style="margin-bottom:12px">${icon('download')} Install app on this device</button>
     ${surveys.length ? `<div class="list">${surveys.map(s => {
       const st = stats[s.id] || { n: 0, open: 0 };
@@ -344,7 +467,10 @@ async function viewSurvey(id) {
     <h2 class="section"><span>Photos &amp; snags (${items.length})</span></h2>
     ${items.length ? `<div class="list">${items.map((it, i) => itemCard(it, i + 1, s.id)).join('')}</div>`
       : `<div class="empty">${icon('camera')}<div><strong>No photos yet</strong></div><div class="small">Tap “Add photo” to take a picture or choose from your library.</div></div>`}
+    ${items.length ? `<button class="btn block" id="backupSurvey" style="margin-top:16px">${icon('download')} Back up this survey</button>` : ''}
   `;
+  fillThumbs(view());
+  $('#backupSurvey')?.addEventListener('click', async () => { await flushSaves(); backupAndOffer([s.id], s.site); });
 
   const saveSurvey = () => saveLater('survey', async () => {
     s.updatedAt = Date.now();
@@ -364,7 +490,7 @@ async function viewSurvey(id) {
   $('#delSurvey').onclick = async () => {
     if (!confirm(`Delete “${s.site || 'this survey'}” and all ${items.length} photo(s)? This cannot be undone.`)) return;
     pending.delete('survey');
-    for (const it of items) await DB.del('items', it.id);
+    await deleteItems(items.map(it => it.id));
     await DB.del('surveys', s.id);
     toast('Survey deleted');
     go('#/');
@@ -385,7 +511,7 @@ function itemCard(it, n, sid) {
   if (it.priority) tags.push(`<span class="tag p-${esc(it.priority)}">${esc(it.priority)}</span>`);
   if (it.status === 'Complete') tags.push(`<span class="tag done">Complete</span>`);
   return `<a class="item-card ${it.status === 'Complete' ? 'is-done' : ''}" href="#/s/${sid}/i/${it.id}">
-    <img src="${urlFor(it.annotated || it.photo)}" alt="">
+    <img data-thumb="${it.id}" alt="">
     <div class="grow">
       <div class="num">#${n}${it.location ? ' · ' + esc(it.location) : ''}</div>
       <div class="desc">${esc(it.comment) || '<span class="muted">No comment yet</span>'}</div>
@@ -393,26 +519,41 @@ function itemCard(it, n, sid) {
     </div></a>`;
 }
 
+// Load thumbnails one at a time after the list renders (keeps memory low on long lists).
+async function fillThumbs(root) {
+  for (const img of $$('img[data-thumb]', root)) {
+    const id = img.dataset.thumb;
+    const rec = (await Images.get(id, 'thumb')) || (await Images.get(id, 'photo'));
+    if (!img.isConnected) return;
+    img.src = urlForRec(rec);
+  }
+}
+
 async function addPhotos(surveyId) {
   await flushSaves();
   const files = await pickPhotos(true);
   if (!files.length) return;
   const done = busy(files.length > 1 ? `Adding ${files.length} photos…` : 'Adding photo…');
-  let last;
+  let last, added = 0;
   try {
     let t = Date.now();
     for (const f of files) {
-      last = {
-        id: uid(), surveyId, createdAt: t++,
-        photo: await processPhoto(f), annotated: null, shapes: [],
+      if (files.length > 1) done.set(`Adding photo ${added + 1} of ${files.length}…`);
+      const recs = await processPhoto(f);
+      const it = {
+        id: uid(), surveyId, createdAt: t++, shapes: [], hasMark: false,
         location: '', comment: '', discipline: '', actionBy: '', dueDate: '', priority: 'Medium', status: 'Open',
       };
-      await DB.put('items', last);
+      await saveItem(it, recs);
+      last = it; added++;
     }
-    await touchSurvey(surveyId);
   } catch (e) {
-    alert(e.message);
-  } finally { done(); }
+    alert((added ? `${added} of ${files.length} photos were added. ` : '') + friendly(e));
+  } finally {
+    done();
+    await touchSurvey(surveyId).catch(() => {});
+  }
+  if (added && added < files.length) return go(`#/s/${surveyId}`);
   if (!last) return;
   if (files.length === 1) go(`#/s/${surveyId}/i/${last.id}`);
   else { toast(`${files.length} photos added`); go(`#/s/${surveyId}`); }
@@ -454,7 +595,7 @@ async function viewItem(sid, iid) {
     </section>
   `;
 
-  const showPhoto = () => { $('#photo').src = urlFor(it.annotated || it.photo); };
+  const showPhoto = async () => { const rec = await Images.display(it); $('#photo').src = urlForRec(rec); };
   showPhoto();
   const save = () => saveLater('item', async () => { await DB.put('items', it); await touchSurvey(sid); });
 
@@ -483,19 +624,28 @@ async function viewItem(sid, iid) {
 
   $('#markup').onclick = async () => {
     await flushSaves();
-    if (await openMarkup(it)) { await DB.put('items', it); await touchSurvey(sid); showPhoto(); toast('Mark-up saved'); }
+    try {
+      const res = await openMarkup(it);
+      if (!res) return;
+      it.hasMark = !!res.mark;
+      await saveItem(it, res);
+      await touchSurvey(sid); showPhoto(); toast('Mark-up saved');
+    } catch (e) { alert(friendly(e)); }
   };
   $('#replace').onclick = async () => {
     const [f] = await pickPhotos(false); if (!f) return;
     if ((it.shapes || []).length && !confirm('Replacing the photo will remove its mark-up. Continue?')) return;
     const done = busy('Updating photo…');
-    try { it.photo = await processPhoto(f); it.annotated = null; it.shapes = []; await DB.put('items', it); showPhoto(); }
-    catch (e) { alert(e.message); } finally { done(); }
+    try {
+      const recs = await processPhoto(f);
+      it.shapes = []; it.hasMark = false; it.photoMissing = false;
+      await saveItem(it, { ...recs, mark: null }); showPhoto();
+    } catch (e) { alert(friendly(e)); } finally { done(); }
   };
   $('#delItem').onclick = async () => {
     if (!confirm('Delete this photo and its write-up?')) return;
     pending.delete('item');
-    await DB.del('items', it.id); await touchSurvey(sid);
+    await deleteItems([it.id]); await touchSurvey(sid);
     toast('Item deleted'); go(`#/s/${sid}`);
   };
 
@@ -550,8 +700,11 @@ function drawShape(ctx, s) {
   ctx.restore();
 }
 
+// Resolves to { mark, thumb } image records when saved, or null when cancelled.
 async function openMarkup(item) {
-  const img = await blobToImage(item.photo);
+  const photoRec = await Images.get(item.id, 'photo');
+  if (!photoRec) { alert('This item has no photo to mark up. Use “Replace” to add one.'); return null; }
+  const img = await blobToImage(recBlob(photoRec));
   const W = img.naturalWidth, H = img.naturalHeight;
   const unit = Math.max(W, H) / 160;
   const shapes = JSON.parse(JSON.stringify(item.shapes || []));
@@ -630,11 +783,12 @@ async function openMarkup(item) {
   canvas.addEventListener('pointercancel', end);
 
   return new Promise(resolve => {
-    const close = saved => {
+    const close = result => {
       window.removeEventListener('resize', fit);
       document.body.style.overflow = '';
+      freeCanvas(canvas);
       el.remove();
-      resolve(saved);
+      resolve(result);
     };
     el.addEventListener('click', async e => {
       const b = e.target.closest('button'); if (!b) return;
@@ -643,12 +797,17 @@ async function openMarkup(item) {
       else if (b.dataset.s) { size = +b.dataset.s; paintBars(); }
       else if (b.dataset.a === 'undo') { shapes.pop(); draw(); }
       else if (b.dataset.a === 'clear') { if (shapes.length && confirm('Remove all mark-up?')) { shapes.length = 0; draw(); } }
-      else if (b.dataset.a === 'cancel') close(false);
+      else if (b.dataset.a === 'cancel') close(null);
       else if (b.dataset.a === 'done') {
-        cur = null; draw();
-        item.shapes = shapes;
-        item.annotated = shapes.length ? await canvasToBlob(canvas, 'image/jpeg', 0.88) : null;
-        close(true);
+        if (b.disabled) return;
+        b.disabled = true;
+        try {
+          cur = null; draw();
+          const mark = shapes.length ? await encodeImage(canvas, Math.max(W, H), 0.88) : null;
+          const thumb = await encodeImage(shapes.length ? canvas : img, THUMB, 0.8);
+          item.shapes = shapes;
+          close({ mark, thumb });
+        } catch (err) { b.disabled = false; alert(friendly(err)); }
       }
     });
   });
@@ -665,6 +824,8 @@ function loadJsPdf() {
     document.head.appendChild(s);
   });
 }
+
+const safeName = x => String(x).replace(/[\\/:*?"<>|]+/g, '-').trim();
 
 function exportSheet(survey, items) {
   const who = [...new Set(items.map(i => i.actionBy).filter(Boolean))].sort();
@@ -683,49 +844,57 @@ function exportSheet(survey, items) {
     </select></label>` : ''}
     <label class="check"><input type="checkbox" id="x-summary" checked> Include summary page</label>
     <label class="check"><input type="checkbox" id="x-done" checked> Include completed items</label>
-    <div class="row" style="margin-top:18px">
-      <button class="btn primary" id="x-dl">${icon('download')} Save PDF</button>
-      ${navigator.canShare ? `<button class="btn dark" id="x-share">${icon('share')} Share</button>` : ''}
-    </div>
-    <button class="btn block" id="x-cancel" style="margin-top:10px">Cancel</button>
+    <button class="btn primary block" id="x-make" style="margin-top:18px">${icon('file')} Create PDF</button>
+    <button class="btn block" id="x-cancel">Cancel</button>
   </div>`;
   document.body.appendChild(back);
-  const close = () => back.remove();
-  back.onclick = e => { if (e.target === back) close(); };
-  $('#x-cancel', back).onclick = close;
+  back.onclick = e => { if (e.target === back) back.remove(); };
+  $('#x-cancel', back).onclick = () => back.remove();
 
-  const make = async () => {
+  $('#x-make', back).onclick = async () => {
     const opts = { person: $('#x-who', back).value, discipline: $('#x-disc', back)?.value || '', summary: $('#x-summary', back).checked, includeDone: $('#x-done', back).checked };
+    const name = `Snagging - ${safeName(survey.site || 'Survey')}${[opts.discipline, opts.person].filter(Boolean).map(x => ' - ' + safeName(x)).join('')} - ${survey.date || today()}.pdf`;
     const done = busy('Creating PDF…');
+    let blob;
     try {
       await loadJsPdf();
-      const blob = await buildPdf(survey, items, opts);
-      const name = `Snagging - ${(survey.site || 'Survey').replace(/[\\/:*?"<>|]+/g, '-')}${[opts.discipline, opts.person].filter(Boolean).map(x => ' - ' + x.replace(/[\\/:*?"<>|]+/g, '-')).join('')} - ${survey.date || today()}.pdf`;
-      return { blob, name };
-    } finally { done(); }
+      blob = await buildPdf(survey, items, opts, msg => done.set(msg));
+    } catch (e) { alert(friendly(e)); return; } finally { done(); }
+    back.remove();
+    offerFile(blob, name, 'PDF ready');
   };
-  $('#x-dl', back).onclick = async () => {
-    try {
-      const { blob, name } = await make();
-      const a = document.createElement('a');
-      a.href = URL.createObjectURL(blob); a.download = name;
-      document.body.appendChild(a); a.click();
-      setTimeout(() => { URL.revokeObjectURL(a.href); a.remove(); }, 10000);
-      close(); toast('PDF saved');
-    } catch (e) { alert(e.message); }
-  };
-  $('#x-share', back)?.addEventListener('click', async () => {
-    try {
-      const { blob, name } = await make();
-      const file = new File([blob], name, { type: 'application/pdf' });
-      if (!navigator.canShare({ files: [file] })) { alert('Sharing files is not supported here — use Save PDF instead.'); return; }
-      await navigator.share({ files: [file], title: name });
-      close();
-    } catch (e) { if (e.name !== 'AbortError') alert(e.message); }
+}
+
+// Hand a finished file to the user. The Share / Download buttons act on a fresh tap, because
+// iPhones block sharing that starts after a long task (such as building the PDF).
+function offerFile(blob, name, heading) {
+  const type = blob.type || 'application/octet-stream';
+  const file = new File([blob], name, { type });
+  let canShare = false;
+  try { canShare = !!navigator.canShare?.({ files: [file] }); } catch { /* not supported */ }
+  const url = URL.createObjectURL(blob);
+  const back = document.createElement('div');
+  back.className = 'sheet-back';
+  back.innerHTML = `<div class="sheet" role="dialog" aria-label="${esc(heading)}">
+    <h3>${icon('check')} ${esc(heading)}</h3>
+    <p class="small muted" style="word-break:break-word">${esc(name)} · ${blob.size < 1048576 ? Math.max(1, Math.round(blob.size / 1024)) + ' KB' : (blob.size / 1048576).toFixed(1) + ' MB'}</p>
+    ${canShare ? `<button class="btn primary block" id="f-share">${icon('share')} ${isIOS() ? 'Share / Save to Files' : 'Share'}</button>` : ''}
+    <a class="btn block ${canShare ? '' : 'primary'}" id="f-dl" href="${url}" download="${esc(name)}">${icon('download')} Download</a>
+    ${type === 'application/pdf' ? `<a class="btn block" id="f-open" href="${url}" target="_blank" rel="noopener">${icon('file')} Open PDF</a>` : ''}
+    <button class="btn block" id="f-close">Done</button>
+  </div>`;
+  document.body.appendChild(back);
+  const close = () => { back.remove(); setTimeout(() => URL.revokeObjectURL(url), 60000); };
+  back.onclick = e => { if (e.target === back) close(); };
+  $('#f-close', back).onclick = close;
+  $('#f-dl', back).addEventListener('click', () => toast('Downloading…'));
+  $('#f-share', back)?.addEventListener('click', async () => {
+    try { await navigator.share({ files: [file], title: name }); }
+    catch (e) { if (e.name !== 'AbortError') alert(`${friendly(e)}\n\nYou can also use Download instead.`); }
   });
 }
 
-async function buildPdf(survey, allItems, opts = {}) {
+async function buildPdf(survey, allItems, opts = {}, onProgress = () => {}) {
   const { jsPDF } = window.jspdf;
   const doc = new jsPDF({ unit: 'mm', format: 'a4', compress: true });
   const PW = 210, PH = 297, M = 12, CW = PW - M * 2;
@@ -739,7 +908,7 @@ async function buildPdf(survey, allItems, opts = {}) {
   const filterLabel = [opts.discipline, opts.person].filter(Boolean).join(' · ');
   const title = filterLabel ? `Snagging Report — ${filterLabel}` : 'Site Survey / Snagging Report';
   let logo = null;
-  try { logo = await blobToDataURL(await (await fetch('img/adi-logo.jpg')).blob()); } catch { /* PDF still works without the logo */ }
+  try { logo = new Uint8Array(await (await fetch('img/adi-logo.jpg')).arrayBuffer()); } catch { /* PDF still works without the logo */ }
 
   const text = (str, x, y, { size = 10, style = 'normal', color = NAVY, align = 'left' } = {}) => {
     doc.setFont('helvetica', style); doc.setFontSize(size); doc.setTextColor(...color);
@@ -852,13 +1021,18 @@ async function buildPdf(survey, allItems, opts = {}) {
     if (i % 2 === 1) { doc.setDrawColor(226, 232, 240); doc.setLineWidth(0.3); doc.line(M, y0 - 4, PW - M, y0 - 4); }
 
     // photo
-    const blob = it.annotated || it.photo;
-    const data = await blobToDataURL(blob);
-    const img = await blobToImage(blob);
-    const sc = Math.min(IMG_W / img.naturalWidth, h / img.naturalHeight);
-    const iw = img.naturalWidth * sc, ih = img.naturalHeight * sc;
-    doc.addImage(data, 'JPEG', M + (IMG_W - iw) / 2, y0, iw, ih, undefined, 'FAST');
-    doc.setDrawColor(203, 213, 225); doc.rect(M + (IMG_W - iw) / 2, y0, iw, ih);
+    onProgress(`Adding photo ${i + 1} of ${items.length}…`);
+    const rec = await Images.display(it);
+    if (rec && rec.w && rec.h) {
+      const sc = Math.min(IMG_W / rec.w, h / rec.h);
+      const iw = rec.w * sc, ih = rec.h * sc;
+      doc.addImage(new Uint8Array(rec.data), rec.type === 'image/png' ? 'PNG' : 'JPEG', M + (IMG_W - iw) / 2, y0, iw, ih, `photo-${it.id}`, 'FAST');
+      doc.setDrawColor(203, 213, 225); doc.rect(M + (IMG_W - iw) / 2, y0, iw, ih);
+    } else {
+      doc.setFillColor(241, 245, 249); doc.rect(M, y0, IMG_W, 60, 'F');
+      text('Photo unavailable', M + IMG_W / 2, y0 + 28, { size: 10, color: MUTED, align: 'center' });
+    }
+    await new Promise(r => setTimeout(r, 0));   // keep the screen responsive on long reports
 
     // write-up
     const pc = PRIO[it.priority] || MUTED;
@@ -912,6 +1086,7 @@ async function buildPdf(survey, allItems, opts = {}) {
     text(`Printed ${fmtDate(today())}`, PW / 2 + 18, PH - 9.5, { size: 8, color: MUTED, align: 'center' });
     text(`Page ${p} of ${total}`, PW - M, PH - 9.5, { size: 8, color: MUTED, align: 'right' });
   }
+  onProgress('Finishing PDF…');
   return doc.output('blob');
 }
 
@@ -981,26 +1156,7 @@ async function viewSettings() {
       <div class="small muted">About ${est.quota > 1073741824 ? (est.quota / 1073741824).toFixed(1) + ' GB' : mb(est.quota) + ' MB'} available to the app on this device. Each photo takes roughly 0.2–0.5 MB.</div>` : ''}`;
   })();
 
-  $('#s-backup').onclick = async () => {
-    const done = busy('Preparing backup…');
-    try {
-      const items = await DB.all('items');
-      for (const it of items) {
-        it.photo = await blobToDataURL(it.photo);
-        it.annotated = it.annotated ? await blobToDataURL(it.annotated) : null;
-      }
-      const data = {
-        app: 'site-snag', version: 1, exportedAt: new Date().toISOString(),
-        settings: { people: await Settings.people(), surveyors: await Settings.surveyors(), disciplines: await Settings.disciplines(), company: await Settings.company(), surveyor: await Settings.get('surveyor', '') },
-        surveys: await DB.all('surveys'), items,
-      };
-      const blob = new Blob([JSON.stringify(data)], { type: 'application/json' });
-      const a = document.createElement('a');
-      a.href = URL.createObjectURL(blob); a.download = `site-snag-backup-${today()}.json`;
-      document.body.appendChild(a); a.click();
-      setTimeout(() => { URL.revokeObjectURL(a.href); a.remove(); }, 10000);
-    } catch (e) { alert(e.message); } finally { done(); }
-  };
+  $('#s-backup').onclick = () => backupAndOffer(null);
   $('#s-restore').onclick = () => {
     const inp = document.createElement('input');
     inp.type = 'file'; inp.accept = 'application/json,.json';
@@ -1011,10 +1167,10 @@ async function viewSettings() {
         const data = JSON.parse(await f.text());
         if (data.app !== 'site-snag') throw new Error('That file is not a Site Snag backup.');
         for (const s of data.surveys) await DB.put('surveys', s);
-        for (const it of data.items) {
-          it.photo = await dataURLToBlob(it.photo);
-          it.annotated = it.annotated ? await dataURLToBlob(it.annotated) : null;
-          await DB.put('items', it);
+        for (let i = 0; i < data.items.length; i++) {
+          done.set(`Restoring photo ${i + 1} of ${data.items.length}…`);
+          const it = data.items[i];
+          await importItem(it, it.photo ? dataURLToBlob(it.photo) : null, it.annotated ? dataURLToBlob(it.annotated) : null);
         }
         for (const key of ['people', 'surveyors', 'disciplines']) {
           const mine = await Settings[key]();
@@ -1022,10 +1178,34 @@ async function viewSettings() {
         }
         toast(`Restored ${data.surveys.length} survey(s)`);
         go('#/');
-      } catch (e) { alert(e.message); } finally { done(); }
+      } catch (e) { alert(friendly(e)); } finally { done(); }
     };
     inp.click();
   };
+}
+
+// Backup file: JSON with photos as data URLs (same format as v1, so old backups still restore).
+// Built in pieces so large backups don't need one giant string in memory.
+async function backupAndOffer(surveyIds, label) {
+  const done = busy('Preparing backup…');
+  let blob;
+  try {
+    const surveys = (await DB.all('surveys')).filter(s => !surveyIds || surveyIds.includes(s.id));
+    const ids = new Set(surveys.map(s => s.id));
+    const items = (await DB.all('items')).filter(it => ids.has(it.surveyId));
+    const settings = { people: await Settings.people(), surveyors: await Settings.surveyors(), disciplines: await Settings.disciplines(), company: await Settings.company(), surveyor: await Settings.get('surveyor', '') };
+    const parts = [`{"app":"site-snag","version":2,"exportedAt":${JSON.stringify(new Date().toISOString())},"settings":${JSON.stringify(settings)},"surveys":${JSON.stringify(surveys)},"items":[`];
+    for (let i = 0; i < items.length; i++) {
+      done.set(`Backing up photo ${i + 1} of ${items.length}…`);
+      const it = items[i];
+      const photo = await Images.get(it.id, 'photo');
+      const mark = it.hasMark ? await Images.get(it.id, 'mark') : null;
+      parts.push((i ? ',' : '') + JSON.stringify({ ...it, photo: photo ? await blobToDataURL(recBlob(photo)) : null, annotated: mark ? await blobToDataURL(recBlob(mark)) : null }));
+    }
+    parts.push(']}');
+    blob = new Blob(parts, { type: 'application/json' });
+  } catch (e) { alert(friendly(e)); return; } finally { done(); }
+  offerFile(blob, `site-snag-backup${label ? ' - ' + safeName(label) : ''} - ${today()}.json`, 'Backup ready');
 }
 
 // ---------------------------------------------------------------- boot
@@ -1033,10 +1213,15 @@ if ('serviceWorker' in navigator && location.protocol !== 'file:') {
   window.addEventListener('load', () => navigator.serviceWorker.register('sw.js').catch(err => console.warn('SW registration failed', err)));
 }
 if (navigator.storage?.persist) navigator.storage.persist().catch(() => {});
-document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'hidden') flushSaves(); });
+document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'hidden') flushSaves().catch(console.warn); });
+// Last line of defence: show a message instead of failing silently.
+window.addEventListener('unhandledrejection', e => { console.error(e.reason); toast(friendly(e.reason)); });
 
 // Exposed for automated tests.
-window.SiteSnag = { buildPdf, getItems, DB, loadJsPdf };
+window.SiteSnag = { buildPdf, getItems, DB, Images, loadJsPdf };
 
-seedDefaults().catch(console.warn).finally(route);
+(async () => {
+  try { await seedDefaults(); await migrateV1Photos(); } catch (e) { console.error(e); }
+  route();
+})();
 })();
