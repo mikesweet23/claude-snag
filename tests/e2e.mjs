@@ -50,6 +50,8 @@ await chooser.setFiles(photos[0]);
 await page.waitForSelector('#comment');
 await page.fill('#loc', 'Kitchen');
 await page.fill('#comment', 'Cracked tile behind sink. Replace tile and re-grout; check sealant around worktop is continuous.');
+const discs = await page.$$eval('#disc .chip:not(.add)', c => c.map(x => x.textContent));
+if (discs.join('|') !== 'HVAC|Plumbing|Mechanical|Electrical|BMS|Building|Civils|Commissioning & Testing|AC|Ventilation') throw new Error('Discipline defaults wrong: ' + discs);
 await page.click('#disc button[data-p="HVAC"]');
 await page.click('#people button[data-p="Plumber"]');
 await page.click('#dueQuick button[data-d="7"]');
@@ -82,7 +84,7 @@ await page.click('.item-card >> nth=1');
 await page.waitForSelector('#comment');
 await page.fill('#loc', 'Bedroom 2');
 await page.fill('#comment', 'Door catches on frame when closing. Plane door edge and re-hang. '.repeat(6));
-await page.click('#disc button[data-p="Pipework"]');
+await page.click('#disc button[data-p="Electrical"]');
 await page.click('#people button[data-p="Joiner"]');
 await page.click('#dueQuick button[data-d="0"]');
 await page.click('#doneBtn');
@@ -105,6 +107,25 @@ const pdfPath = `${OUT}/${dl.suggestedFilename()}`;
 await dl.saveAs(pdfPath);
 const pdf = fs.readFileSync(pdfPath);
 console.log('PDF:', pdfPath, pdf.length, 'bytes', 'pages:', (pdf.toString('latin1').match(/\/Type\s*\/Page[^s]/g) || []).length);
+await page.click('#f-close');
+
+// Contractor sign-off sheet for one trade only (fillable PDF)
+await page.click('#makePdf');
+await page.click('#x-type [data-v="signoff"]');
+await page.selectOption('#x-disc', 'HVAC');
+await page.screenshot({ path: `${OUT}/8-signoff-options.png` });
+await page.click('#x-make');
+await page.waitForSelector('#f-dl');
+[dl] = await Promise.all([page.waitForEvent('download'), page.click('#f-dl')]);
+const signPath = `${OUT}/${dl.suggestedFilename()}`;
+await dl.saveAs(signPath);
+const sp = fs.readFileSync(signPath, 'latin1');
+const fields = [...sp.matchAll(/\/T \(([^)]+)\)/g)].map(m => m[1]);
+console.log('Sign-off PDF:', dl.suggestedFilename(), 'fields:', fields.join(', '));
+for (const f of ['item1_completed', 'item1_name', 'item1_date', 'item1_signature', 'final_signature']) if (!fields.includes(f)) throw new Error('Missing form field ' + f);
+if (fields.some(f => f.startsWith('item2_'))) throw new Error('Sign-off sheet included another trade');
+if (/\/AcroForm \d+ 0 R/.test(sp) && /\/Fields[\s\S]{0,200}stream/.test(sp)) throw new Error('Form fields written as streams (unreadable by PDF apps)');
+if (/\/FT \/Btn[\s\S]{0,80}\/V \/On/.test(sp)) throw new Error('Checkbox pre-ticked');
 await page.click('#f-close');
 
 // Persistence: reload and check data survives

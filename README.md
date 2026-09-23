@@ -8,12 +8,16 @@ A simple, offline-first web app (PWA) for site surveys and snagging. No sign-in,
 - **adi Climate Systems branding.** The logo and brand blues are used in the app and on every PDF page. The company name defaults to *adi Climate Systems Limited* and can be changed in Settings.
 - **Photos.** Take a photo or pick several from the library. Each photo becomes a snag item.
 - **Mark-up.** Draw arrows, freehand lines, boxes, circles and text labels on a photo, in 6 colours and 3 line sizes, with undo. The original photo is kept, so you can edit the mark-up again later.
-- **Write-up** for each photo: location or area, comments, **discipline** (HVAC, Plumbing, Pipework, CAD or Engineering, and you can add more), **who to action** (one-tap names, add your own), **action by date** (Today, Tomorrow, 1 week, 2 weeks, 1 month, or pick a date), priority, and Open/Complete status.
+- **Write-up** for each photo: location or area, comments, **discipline / trade** (HVAC, Plumbing, Mechanical, Electrical, BMS, Building, Civils, Commissioning & Testing, AC or Ventilation, and *+ Add* for more), **who to action** (one-tap names, add your own), **action by date** (Today, Tomorrow, 1 week, 2 weeks, 1 month, or pick a date), priority, and Open/Complete status.
 - **PDF report (A4):**
   - Optional summary page with survey details, actions grouped by person and an item schedule.
   - Then **2 photos per page**, each with its write-up beside it: location, a highlighted "Who to action / Action by" box, and comments.
   - Overdue dates show in red. Each page has a header with the site and date, and a footer with the surveyor and page numbers.
   - You can make a PDF for one person and/or one discipline only (for example, just the HVAC items) and choose whether to leave out completed items.
+  - **Contractor sign-off sheet:** choose *Contractor sign-off* and a discipline/trade to send that trade only its own items. It creates a **fillable PDF**:
+    - each item has a **Completed** tick box and **Comments**, **Name**, **Date** and **Signature** fields;
+    - the cover page explains how to fill it in and ends with a **final sign-off** (company, name, signature, date).
+    - The contractor fills it in with Adobe Acrobat Reader (free) or their phone's PDF viewer, signs it and sends it back. Completed items are left out by default.
   - Tap **Create PDF**. When it's ready, **Share** (on iPhone: *Share / Save to Files*) opens the phone's share sheet for email, WhatsApp, Files and so on. **Download** and **Open PDF** also work.
 - **Settings:** company name, default surveyor, the surveyor/discipline/who-to-action lists, storage used on the device, and **backup/restore** to a file (use this to move surveys between devices). Each survey also has a **Back up this survey** button.
 
