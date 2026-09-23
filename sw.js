@@ -1,5 +1,5 @@
 // Offline cache for the app shell. Bump VERSION when shipping changes.
-const VERSION = 'site-snag-v3';
+const VERSION = 'site-snag-v4';
 const ASSETS = [
   './', 'index.html', 'styles.css', 'app.js', 'manifest.webmanifest',
   'vendor/jspdf.umd.min.js', 'img/adi-logo.jpg',

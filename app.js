@@ -109,7 +109,7 @@ const DB = {
   byIndex: (s, i, v) => run(s, 'readonly', st => st.index(i).getAll(v)),
 };
 const DEFAULT_PEOPLE = ['Main Contractor', 'Electrician', 'Plumber', 'Joiner', 'Decorator', 'Client'];
-const DEFAULT_SURVEYORS = ['Paul Bonner', 'Paul Heaton', 'Kass Weetman', 'Alex Slattery', 'Mike Slattery', 'Stuart Clements'];
+const DEFAULT_SURVEYORS = ['Paul Bonner', 'Paul Heaton', 'Kass Weetman', 'Alex Slattery', 'Mike Slattery', 'Stuart Clements', 'Mike Sweet'];
 const DEFAULT_DISCIPLINES = ['HVAC', 'Plumbing', 'Pipework', 'CAD', 'Engineering'];
 const DEFAULT_COMPANY = 'adi Climate Systems Limited';
 const Settings = {
@@ -122,9 +122,14 @@ const Settings = {
 };
 // One-off upgrade for devices that used the first version (company was blank then).
 async function seedDefaults() {
-  if ((await Settings.get('seed', 0)) >= 2) return;
-  if (!(await Settings.get('company', ''))) await Settings.set('company', DEFAULT_COMPANY);
-  await Settings.set('seed', 2);
+  const seed = await Settings.get('seed', 0);
+  if (seed < 2 && !(await Settings.get('company', ''))) await Settings.set('company', DEFAULT_COMPANY);
+  // v3: add names to the default surveyor list for devices that already saved their own copy.
+  if (seed < 3) {
+    const saved = await Settings.get('surveyors');
+    if (saved && !saved.includes('Mike Sweet')) await Settings.set('surveyors', [...saved, 'Mike Sweet']);
+  }
+  if (seed < 3) await Settings.set('seed', 3);
 }
 
 // <select> with an "Add another…" option that prompts for a new name and remembers it.

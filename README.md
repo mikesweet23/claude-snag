@@ -4,7 +4,7 @@ A simple, offline-first web app (PWA) for site surveys and snagging. No sign-in,
 
 ## What it does
 
-- **Surveys** hold the site name, address, surveyor (drop-down list: Paul Bonner, Paul Heaton, Kass Weetman, Alex Slattery, Mike Slattery, Stuart Clements, plus *Add another…*), date (defaults to today), client/project ref and general notes.
+- **Surveys** hold the site name, address, surveyor (drop-down list: Paul Bonner, Paul Heaton, Kass Weetman, Alex Slattery, Mike Slattery, Stuart Clements, Mike Sweet, plus *Add another…*), date (defaults to today), client/project ref and general notes.
 - **adi Climate Systems branding.** The logo and brand blues are used in the app and on every PDF page. The company name defaults to *adi Climate Systems Limited* and can be changed in Settings.
 - **Photos.** Take a photo or pick several from the library. Each photo becomes a snag item.
 - **Mark-up.** Draw arrows, freehand lines, boxes, circles and text labels on a photo, in 6 colours and 3 line sizes, with undo. The original photo is kept, so you can edit the mark-up again later.

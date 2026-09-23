@@ -38,7 +38,7 @@ await page.click('#newSurvey');
 await page.fill('#f-site', 'Plot 12, Riverside Court');
 await page.fill('#f-address', '1 River Lane, Leeds');
 const surveyors = await page.$$eval('#f-surveyor option', o => o.map(x => x.textContent));
-if (!surveyors.includes('Stuart Clements')) throw new Error('Surveyor list missing defaults: ' + surveyors);
+if (!surveyors.includes('Stuart Clements') || !surveyors.includes('Mike Sweet')) throw new Error('Surveyor list missing defaults: ' + surveyors);
 await page.selectOption('#f-surveyor', 'Mike Slattery');
 await page.fill('#f-client', 'ACME Homes / J1234');
 await page.fill('#f-notes', 'Pre-handover snagging walk-round.');
